@@ -31,12 +31,25 @@ cargo test --release
 cargo clippy --release --all-targets -- -D warnings
 ```
 
-The unit test suite (100+ tests) needs nothing beyond the Rust toolchain
+The unit test suite (110+ tests) needs nothing beyond the Rust toolchain
 and runs in well under a second — it covers CLI parsing, PCI/virtio
 protocol logic, ACPI table integrity (checksum verification always; a
 real `iasl` round-trip additionally, if installed), snapshot format
 round-trips, and the Python plugin bridge (both loaders), all without
 `/dev/kvm`.
+
+A subset of these are **property-based tests** (via the `proptest`
+dev-dependency — no extra install needed, `cargo` fetches it like any
+other crate) rather than hand-picked cases: `pci::tests::
+arbitrary_config_space_traffic_never_panics`, `virtio::tests::
+try_pop_never_returns_an_out_of_bounds_or_oversized_chain`, and a few
+others in `mem.rs`/`virtio_net.rs`/`virtio_rng.rs`. Each runs hundreds of
+generated inputs per `cargo test` invocation; a failure is saved to
+`proptest-regressions/<file>.txt` and replayed first on the next run, so
+check that file in if a genuine regression is ever found there. See
+[security/defendmap.md](security/defendmap.md) for exactly which
+guest-controlled-input surfaces have this kind of coverage and which
+still only have hand-picked tests.
 
 `tests/boot.rs` additionally runs **real boot tests against actual KVM
 guests** — not mocked, not simulated. They need `/dev/kvm`, a kernel image
@@ -181,12 +194,16 @@ src/
   error.rs               how a run ends (Result-based, not process::exit)
   control.rs              the live control-socket protocol
   snapshot.rs             the snapshot/restore file format
+  seccomp.rs              seccomp-bpf deny-list for the sandboxed-plugin
+                         subprocess
   tty.rs / cpuid.rs      terminal raw-mode handling; CPUID curation
 devices/                 example/reference Python device plugins
 python/hyperbug/          the installable Python package
 acpi/dsdt.asl             the one hand-authored AML source, compiled via
                          iasl into src/dsdt.aml at build time
 tests/boot.rs             real KVM-backed integration tests
+docs/security/            trust model, per-surface attack-surface map,
+                         unsafe-block audit
 ```
 
 ## Design conventions worth preserving

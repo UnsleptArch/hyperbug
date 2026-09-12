@@ -7,7 +7,7 @@ this directly. Invoked by the Rust side (`src/pydevice_proc.rs`) as::
     python3 -m hyperbug._sandbox_runner <plugin_path> <class_name>
 
 Why a real subprocess instead of another in-process interruption trick:
-DEBTS.md item 9 already tried two different ways to forcibly interrupt a
+this project already tried two different ways to forcibly interrupt a
 stuck plugin call from *inside* the same process (`PyErr_SetInterrupt`,
 `PyThreadState_SetAsyncExc`) — one hung under real concurrent load, the
 other segfaulted. Neither failure mode is possible here: a subprocess that

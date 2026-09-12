@@ -117,11 +117,10 @@ fn build_madt(num_cpus: u8) -> Vec<u8> {
     }
 
     // struct acpi_madt_io_apic (type=1, len=12): id, reserved, address,
-    // global_irq_base. This table used to omit this subtable entirely
-    // (DEBTS.md item 29/33's history), on the theory that keeping the
-    // guest ignorant of any I/O APIC would keep Linux on the legacy 8259
-    // PIC for every interrupt. Real evidence (a kprobe on
-    // `request_threaded_irq`, see DEBTS.md item 33) showed that theory was
+    // global_irq_base. This table used to omit this subtable entirely, on
+    // the theory that keeping the guest ignorant of any I/O APIC would
+    // keep Linux on the legacy 8259 PIC for every interrupt. Real evidence
+    // (a kprobe on `request_threaded_irq`) showed that theory was
     // wrong: once ACPI enables Local APIC mode (which happens the moment
     // *any* Local APIC entries exist above, regardless of PCAT_COMPAT),
     // Linux abandons the 8259 entirely — `/proc/interrupts` under ACPI
@@ -335,10 +334,9 @@ pub mod exit_code {
     pub const TRIPLE_FAULT: i32 = 11;
     // 12 (HALTED) is retired now that HLT is ordinary cpu-idle (masking
     // MWAIT out of CPUID makes Linux use HLT constantly, not just at a
-    // genuine dead end — see main.rs's VcpuExit::Hlt handling and
-    // DEBTS.md item 30) — kept reserved, not reused, since
-    // python/hyperbug/vm.py's ExitCode.HALTED still documents it for any
-    // process that was built before this change.
+    // genuine dead end — see main.rs's VcpuExit::Hlt handling) — kept
+    // reserved, not reused, since python/hyperbug/vm.py's ExitCode.HALTED
+    // still documents it for any process that was built before this change.
 }
 
 /// The `SLEEP_CONTROL_REG`/`SLEEP_STATUS_REG` pair (ACPI 5.0's
@@ -412,7 +410,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    // DEBTS.md item 16: every field offset here was checked against real
+    // Every field offset here was checked against real
     // ACPICA headers, but the *assembled* tables were only ever checksum-
     // reasoned by hand. These tests check the checksum arithmetic in pure
     // Rust (no external tool needed), then — if `iasl` is installed —

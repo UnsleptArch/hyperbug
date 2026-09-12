@@ -1,6 +1,5 @@
 //! A device plugin run in its own subprocess instead of in-process via
-//! PyO3 — real OS-level isolation for a slow or buggy plugin (DEBTS.md
-//! item 9).
+//! PyO3 — real OS-level isolation for a slow or buggy plugin.
 //!
 //! Two different in-process interruption mechanisms were already tried
 //! and reverted before this: `PyErr_SetInterrupt` (ambiguous "main
@@ -20,6 +19,7 @@
 //! replying to it.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -145,12 +145,28 @@ impl SandboxedPyDevice {
         dma_range: Option<(u64, u64)>,
     ) -> Result<Self, HyperbugError> {
         let python_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/python");
-        let mut child = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .args(["-m", "hyperbug._sandbox_runner", path, class_name])
             .env("PYTHONPATH", python_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // SAFETY: `pre_exec` runs in the freshly-forked child, before
+        // `exec`, with exactly one thread alive — `install_subprocess_
+        // filter` only issues a couple of syscalls (no allocation beyond
+        // what already happened before `fork`, no locking), which is
+        // exactly the kind of narrow, async-signal-safety-respecting work
+        // `pre_exec`'s own safety contract requires. A filter-install
+        // failure here aborts the exec with the returned `io::Error`
+        // rather than silently running the plugin unconfined.
+        unsafe {
+            command.pre_exec(|| {
+                crate::seccomp::install_subprocess_filter()
+                    .map_err(std::io::Error::other)
+            });
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| HyperbugError::Io(format!("spawning sandboxed device {path}: {e}")))?;
 
@@ -489,9 +505,9 @@ mod tests {
 
     /// The actual point of this whole file: a plugin that hangs forever in
     /// `write()` must not stall the caller anywhere near that long. Neither
-    /// of DEBTS.md item 9's two prior in-process interruption attempts
-    /// could make this guarantee (one hung under load, one segfaulted) —
-    /// this is what a real subprocess boundary buys instead.
+    /// of the two prior in-process interruption attempts tried before this
+    /// file existed could make this guarantee (one hung under load, one
+    /// segfaulted) — this is what a real subprocess boundary buys instead.
     #[test]
     fn a_hung_write_is_killed_instead_of_stalling_forever() {
         if !require_python3() {

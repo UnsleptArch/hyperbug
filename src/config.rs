@@ -156,7 +156,7 @@ pub struct Args {
     pub devices: Vec<DeviceSpec>,
     pub pci_devices: Vec<PciDeviceSpec>,
     /// `--device-sandboxed`: same spec syntax as `devices`, but the plugin
-    /// runs in its own subprocess (DEBTS.md item 9) instead of in-process
+    /// runs in its own subprocess instead of in-process
     /// — a hung or crashed plugin gets killed rather than stalling or
     /// taking down the whole guest. See `pydevice_proc.rs`.
     pub sandboxed_devices: Vec<DeviceSpec>,
@@ -180,8 +180,9 @@ pub struct Args {
     /// exactly that point. `kernel` is still required by the parser but
     /// unused in this mode (device wiring — disks/net/pci-devices — still
     /// comes from the rest of `Args`, and must match what was running
-    /// when the snapshot was taken). DEBTS.md item 8 has the full scope
-    /// and limitations (single-vCPU only, no Python device plugin state).
+    /// when the snapshot was taken). Single-vCPU only, and no Python
+    /// device plugin state is captured — see `snapshot.rs` for the full
+    /// scope and limitations.
     pub restore: Option<String>,
 }
 

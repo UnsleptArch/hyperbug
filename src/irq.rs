@@ -1,8 +1,8 @@
 //! Real KVM irqfd-backed interrupt lines, replacing the old "call
 //! `vm.set_irq_line(irq, true); vm.set_irq_line(irq, false)` pulse from
-//! whichever thread noticed the event" pattern — part of DEBTS.md's
-//! event-loop item (the 20ms-poll loop lacking real irqfd/ioeventfd/epoll
-//! integration).
+//! whichever thread noticed the event" pattern — replacing the 20ms-poll
+//! loop's lack of real irqfd/ioeventfd/epoll integration with the real
+//! thing.
 //!
 //! Once registered, injecting the interrupt is a plain eventfd write from
 //! *any* thread — no `VmFd`/ioctl call, and no need to route the event

@@ -1,4 +1,4 @@
-//! Whole-machine save/restore (DEBTS.md item 8): serialize a running
+//! Whole-machine save/restore: serialize a running
 //! guest's vCPU state, memory, and every snapshotted device's protocol
 //! state to a file, and reload it later to resume execution from exactly
 //! that point.

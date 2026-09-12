@@ -1,5 +1,5 @@
-//! Real boot tests — the thing DEBTS.md item 1 has said all along is the
-//! only check that actually matters, turned into something a future
+//! Real boot tests — the only check that actually verifies this VMM
+//! works, turned into something a future
 //! session (or CI) can re-run automatically instead of a human manually
 //! repeating the scratchpad process this project's whole history has
 //! relied on so far. Every bug found via manual boot testing this
@@ -113,10 +113,10 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<i32> {
 
 /// A real pseudo-terminal, opened via `posix_openpt`/`grantpt`/`unlockpt`
 /// (all already available through the `libc` crate, no new dependency
-/// needed) — a plain pipe isn't representative of real keyboard input
-/// (see DEBTS.md item 29/31's session log: a pipe-based simulation showed
-/// confusing partial-byte-loss that turned out to be a pipe-timing
-/// artifact, not a real bug, and only a real PTY caught that).
+/// needed) — a plain pipe isn't representative of real keyboard input: an
+/// earlier pipe-based simulation showed confusing partial-byte-loss that
+/// turned out to be a pipe-timing artifact, not a real bug, and only a
+/// real PTY caught that.
 struct Pty {
     master: File,
     slave_path: PathBuf,
@@ -196,7 +196,8 @@ fn boots_with_disk_and_shuts_down_cleanly_under_acpi() {
 
     assert!(
         !stderr.contains("probe with driver virtio-pci failed") && !stderr.contains("can't assign; no space"),
-        "virtio-pci BAR assignment regressed (DEBTS.md item 28's _CRS fix):\n{stderr}"
+        "virtio-pci BAR assignment regressed (the ACPI _CRS fix that gives PCI a real \
+         I/O/memory aperture to assign BARs from):\n{stderr}"
     );
     assert!(
         !stderr.contains("registering ioeventfd") && !stderr.contains("unregistering stale ioeventfd"),
@@ -214,14 +215,15 @@ fn boots_with_disk_and_shuts_down_cleanly_under_acpi() {
 
 /// Test 2: the guest's serial console is a *real* two-way interactive
 /// terminal — the actual thing that makes hyperbug "a VM you can play
-/// with" rather than a one-way boot log (DEBTS.md items 29/31). Types a
+/// with" rather than a one-way boot log. Types a
 /// real command through a real PTY and checks the guest's own computed
 /// answer comes back, then exits via the Ctrl-] escape hatch (needed
-/// under `acpi=off`, which has no self-terminating halt path — see item
-/// 30). Uses `acpi=off` deliberately, as a minimal baseline distinct from
+/// under `acpi=off`, which has no self-terminating halt path). Uses
+/// `acpi=off` deliberately, as a minimal baseline distinct from
 /// the ACPI-on case `interactive_console_works_alongside_acpi_and_pci`
-/// below covers — item 33 (console silent under ACPI) is now fixed, so
-/// this is no longer "the only config that works", just the simplest one.
+/// below covers — the console-silent-under-ACPI bug that once made this
+/// the only config that worked is fixed, so this is now just the
+/// simplest one.
 #[test]
 fn interactive_console_accepts_real_keyboard_input() {
     let Some(kernel) = find_kernel() else {
@@ -306,8 +308,9 @@ fn interactive_console_accepts_real_keyboard_input() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Test: the actual fix for DEBTS.md item 33 — a real interactive console
-/// *and* PCI/virtio *and* a clean ACPI shutdown, all at once, under the
+/// Test: the actual fix for the console-silent-under-ACPI bug — a real
+/// interactive console *and* PCI/virtio *and* a clean ACPI shutdown, all
+/// at once, under the
 /// plain default cmdline (no `acpi=off`). Before this fix, that
 /// combination was impossible: ACPI on gave PCI/virtio and clean
 /// shutdown but a silent console (`request_threaded_irq(4, ...)` failed
@@ -436,7 +439,7 @@ fn open_slave(path: &Path) -> Stdio {
     Stdio::from(file)
 }
 
-/// Test 3: DEBTS.md item 11 — real SMP. Boots with `--smp 4` and checks
+/// Test 3: real SMP. Boots with `--smp 4` and checks
 /// the guest's own SMP bring-up log for proof every AP actually came
 /// online through a real INIT-SIPI-SIPI sequence (KVM's in-kernel APIC,
 /// not anything this codebase implements directly) — "Total of N
@@ -501,7 +504,7 @@ fn boots_with_multiple_cpus_and_they_all_come_online() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Test 5: DEBTS.md item 2 — a real PCI capability list + MSI. Attaches
+/// Test 5: a real PCI capability list + MSI. Attaches
 /// `devices/dma_demo.py` (a Python `--pci-device` with `msi_capable =
 /// True`) and checks the guest's own PCI core actually walks the
 /// capability chain without erroring — a malformed capability list is a
@@ -706,7 +709,7 @@ fn boots_with_virtio_rng_over_the_modern_pci_transport() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Test 6: DEBTS.md item 20 — live VM control. Connects to the control
+/// Test 6: live VM control. Connects to the control
 /// socket of a *running* guest and does a real read/write round trip
 /// against its memory, a real register read *and* write, and attaches a
 /// second client alongside the first — proving the feature actually works
@@ -726,7 +729,7 @@ fn live_control_socket_can_peek_and_poke_a_running_guest() {
     let dir = std::env::temp_dir().join(format!("hyperbug-control-test-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     // acpi=off's guest never self-terminates on halt (no ACPI reset/sleep
-    // registers to trigger — see DEBTS.md item 30), which is exactly what
+    // registers to trigger), which is exactly what
     // this test wants: stay alive and idle for as long as it takes to
     // connect and issue commands, then get killed explicitly rather than
     // needing to coordinate a clean shutdown with a live control session.
@@ -829,7 +832,7 @@ fn live_control_socket_can_peek_and_poke_a_running_guest() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Test 7: DEBTS.md item 8 — snapshot/restore. Boots a real guest, saves a
+/// Test 7: snapshot/restore. Boots a real guest, saves a
 /// snapshot through the control socket while it's running, kills that
 /// process outright (not a clean shutdown — resuming from a snapshot is
 /// the point, not a graceful handoff), relaunches an entirely separate
@@ -851,8 +854,9 @@ fn live_control_socket_can_peek_and_poke_a_running_guest() {
 /// *specific blocked userspace task* via a post-restore interrupt (typing
 /// into a resumed interactive shell, concretely) still crashes the guest —
 /// a kernel stack-guard-page hit during that task's FPU context switch.
-/// Recorded honestly as still-open in DEBTS.md item 8 rather than forced
-/// green by avoiding the one thing that currently breaks it.
+/// Recorded honestly as a still-open gap (see `docs/security/security.md`)
+/// rather than forced green by avoiding the one thing that currently
+/// breaks it.
 #[test]
 fn snapshot_then_restore_resumes_to_a_live_idle_guest() {
     let Some(kernel) = find_kernel() else {

@@ -5,7 +5,7 @@
 //!
 //! Deliberately not a general/spec-complete PCI host bridge: no bridges,
 //! no multi-function devices. Has a capability list and single-message
-//! (32-bit, no per-vector masking) MSI (DEBTS.md item 2) — opt-in via
+//! (32-bit, no per-vector masking) MSI — opt-in via
 //! `PciDevice::msi_capable()`, for a **custom `--pci-device` Python
 //! plugin's own device model**, not hyperbug's own virtio devices.
 //! Checked directly against the real Linux virtio driver source
@@ -684,6 +684,7 @@ impl PciBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     struct DummyMsiDevice {
         bar0: u32,
@@ -981,5 +982,68 @@ mod tests {
 
         vm.unregister_ioevent(&eventfd, &IoEventAddress::Pio(u64::from(PORT)), DATAMATCH)
             .expect("unregister_ioevent");
+    }
+
+    /// One CF8/CFC-level operation a guest (or a fuzzer standing in for
+    /// one) can issue against config space, at the raw `io_out`/`io_in`
+    /// port level — the same interface `Harness::select`/`write_at`/
+    /// `read_dword` wrap for the hand-picked tests above.
+    #[derive(Debug, Clone)]
+    enum ConfigOp {
+        Select { devfn: u8, reg: u16 },
+        Write { byte_offset: u16, data: Vec<u8> },
+        Read,
+    }
+
+    fn arbitrary_config_op() -> impl Strategy<Value = ConfigOp> {
+        prop_oneof![
+            (any::<u8>(), any::<u16>()).prop_map(|(devfn, reg)| ConfigOp::Select { devfn, reg }),
+            // `byte_offset` is bounded to 0..=3: the real CONFIG_DATA/
+            // CONFIG_DATA_END port window (`Harness::write_at` computes
+            // `CONFIG_DATA + byte_offset` as the port to drive `io_out`
+            // with, and only that 4-byte window is real CF8/CFC address
+            // space at all — anything else falls outside `io_out`'s own
+            // `CONFIG_DATA..=CONFIG_DATA_END` match arm and is a no-op, or
+            // for a large enough offset, overflows the `u16` addition
+            // itself. Testing that unreachable range would just be
+            // asserting properties of `Harness`'s own test-only port
+            // arithmetic, not of anything a real guest can reach.
+            (0u16..4, proptest::collection::vec(any::<u8>(), 0..8))
+                .prop_map(|(byte_offset, data)| ConfigOp::Write { byte_offset, data }),
+            Just(ConfigOp::Read),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        /// Drives `PciBus::io_out`/`io_in` — the exact entry point a real
+        /// guest's `out`/`in` instructions reach — with an arbitrary
+        /// sequence of config-address selections, writes of arbitrary
+        /// length/offset/content, and reads, against a real registered
+        /// MSI-capable device. Nothing here asserts a specific resulting
+        /// value; the property is that **no sequence of guest-controlled
+        /// config-space traffic panics**, regardless of devfn, register,
+        /// byte offset, or data length — including sequences that select
+        /// a devfn with no device registered at all, write a length other
+        /// than 1/2/4 bytes, or hit the BAR/MSI/command registers in any
+        /// order (interleaving a partial BAR-sizing sequence with MSI
+        /// writes, say — exactly the kind of ordering a hand-picked test
+        /// wouldn't think to try).
+        #[test]
+        fn arbitrary_config_space_traffic_never_panics(
+            ops in proptest::collection::vec(arbitrary_config_op(), 0..64),
+        ) {
+            let (mut h, _dev) = Harness::new(0x08, 0x1000);
+            for op in ops {
+                match op {
+                    ConfigOp::Select { devfn, reg } => h.select(devfn, reg & 0xfc),
+                    ConfigOp::Write { byte_offset, data } => h.write_at(byte_offset, &data),
+                    ConfigOp::Read => {
+                        let _ = h.read_dword();
+                    }
+                }
+            }
+        }
     }
 }

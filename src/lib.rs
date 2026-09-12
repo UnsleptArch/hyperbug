@@ -28,6 +28,7 @@ mod pci;
 mod pydevice;
 mod pydevice_proc;
 mod reactor;
+mod seccomp;
 mod serial;
 mod snapshot;
 mod tty;
@@ -223,7 +224,7 @@ fn validate_restore(args: &Args) -> Result<(), HyperbugError> {
     }
     if args.smp != 1 {
         return Err(HyperbugError::Config(
-            "--restore only supports --smp 1 today (DEBTS.md item 8)".to_string(),
+            "--restore only supports --smp 1 today".to_string(),
         ));
     }
     if !args.devices.is_empty()
@@ -233,7 +234,7 @@ fn validate_restore(args: &Args) -> Result<(), HyperbugError> {
     {
         return Err(HyperbugError::Config(
             "--restore doesn't support Python device plugins yet — their state isn't part \
-             of a snapshot (DEBTS.md item 8)"
+             of a snapshot"
                 .to_string(),
         ));
     }
@@ -434,9 +435,9 @@ fn setup_bsp(
 /// is harmless (`main`'s `std::process::exit` tears every thread down
 /// regardless); a library caller keeping the process alive after `run`
 /// returns should be aware these threads may still be running — a known,
-/// stated limitation (see DEBTS.md), whose proper fix needs a real
-/// per-vCPU kick mechanism that was attempted and reverted after it caused
-/// a worse regression.
+/// stated limitation, whose proper fix needs a real per-vCPU kick
+/// mechanism that was attempted and reverted after it caused a worse
+/// regression (see `docs/architecture.md`'s History section).
 fn spawn_vcpu_threads(mut vcpus: Vec<VcpuFd>, env: &VcpuEnv) -> Result<GuestExit, HyperbugError> {
     for (index, ap) in vcpus.drain(1..).enumerate() {
         let cpu_id = index as u8 + 1;

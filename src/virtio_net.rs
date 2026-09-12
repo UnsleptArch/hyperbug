@@ -42,6 +42,7 @@ impl IfReq {
     }
 }
 
+
 // Neither is exposed by the libc crate for glibc-linux targets, but both
 // are stable, well-known Linux ABI constants (<linux/sockios.h>).
 const SIOCGIFFLAGS: libc::c_ulong = 0x8913;

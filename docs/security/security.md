@@ -5,6 +5,11 @@ trusted, what's assumed hostile, what's enforced against it, and what
 isn't. It is written for someone deciding whether to point hyperbug at a
 guest, kernel, disk image, or device plugin they don't fully control.
 
+For the concrete, per-surface counterpart to this — every place
+untrusted bytes actually reach hyperbug's parsing/dispatch code, and
+whether that specific surface is defended, partially defended, or held
+open — see [defendmap.md](defendmap.md).
+
 ## Trust boundaries, in order of how much they're actually enforced
 
 ### 1. The host operator is fully trusted
@@ -80,19 +85,32 @@ fully trusted, and they solve *different* problems:
   liveness** from a plugin that hangs or crashes — a stuck or dead
   subprocess is `SIGKILL`ed and the device starts answering like an
   unmapped one, rather than wedging a vCPU thread forever or bringing down
-  the whole process. It is **not** a security sandbox in the seccomp/
-  namespace/capability-dropping sense: the child process still runs as
-  the same user, with the same filesystem and network access, as the
-  parent. It solves availability/robustness, not privilege containment.
+  the whole process. On top of that, the subprocess is launched under a
+  real seccomp-bpf **deny-list** (`src/seccomp.rs`, installed via
+  `Command::pre_exec` between `fork` and `exec`): a specific set of
+  syscalls with no legitimate use in a device plugin — `ptrace`,
+  `process_vm_readv`/`writev`, the mount/kernel-module/reboot family,
+  `bpf`, `perf_event_open`, and a few other classic privilege-escalation
+  primitives — are denied with `EPERM`. This is deliberately **not** an
+  allow-list sandbox: enumerating everything a full Python interpreter's
+  normal operation legitimately needs (imports, its allocator, whatever
+  I/O a legitimate plugin does) would be both far larger and more
+  fragile across Python versions than a small, targeted deny-list. So the
+  subprocess still runs as the same user, with the same filesystem and
+  network access, as the parent, and with no namespace or capability
+  drop — it solves availability/robustness fully, and closes off a
+  specific, named set of privilege-escalation/boundary-crossing
+  primitives, but is **not** full privilege containment.
 
 **Combine both when a plugin is genuinely untrusted** (third-party code,
 something still being debugged): `--device-sandboxed ...:<dma_base>:
-<dma_size>` gets you both "a hang or crash can't take anything else down"
-and "a bad memory access can't reach guest RAM it has no business
-touching." Neither alone is a substitute for the other, and neither is a
-substitute for actually reviewing third-party plugin code before running
-it — there is currently no seccomp filter, namespace, or capability drop
-applied to a sandboxed plugin's subprocess.
+<dma_size>` gets you "a hang or crash can't take anything else down," "a
+bad memory access can't reach guest RAM it has no business touching," and
+"a small set of privilege-escalation syscalls are denied outright." None
+of these are a substitute for actually reviewing third-party plugin code
+before running it — the child still runs as the same user with the same
+filesystem/network access as the parent, with no namespace, capability
+drop, or UID change.
 
 ### 4. The live control socket is a full-trust local interface
 
@@ -186,8 +204,14 @@ filtering of its own.
 
 ### What is explicitly out of scope today
 
-- No seccomp/namespace/capability sandboxing of sandboxed-plugin
-  subprocesses (see above) — they're isolated for liveness, not privilege.
+- No namespace/capability/UID sandboxing of sandboxed-plugin subprocesses
+  (see above) — a seccomp *deny-list* now blocks a specific set of
+  privilege-escalation syscalls, but the subprocess still runs as the
+  same user with the same filesystem/network access as the parent.
+- No syscall filtering of any kind on the main VMM process itself (only
+  the sandboxed-plugin subprocess has one) — it embeds a full CPython
+  interpreter via PyO3 for in-process plugins, which makes a safe filter
+  for that process a separate, larger piece of work.
 - No guest-facing IOMMU / DMA remapping for the built-in virtio devices.
 - No authentication, encryption, or access control on the control socket
   beyond OS filesystem permissions on its path.

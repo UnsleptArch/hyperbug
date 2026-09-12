@@ -8,7 +8,7 @@ jobs:
   test:
     # GitHub's Ubuntu runners have /dev/kvm and a real kernel image
     # already present — both of `tests/boot.rs`'s real boot tests need
-    # exactly that (see DEBTS.md item 23), not a special CI-only setup.
+    # exactly that, not a special CI-only setup.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

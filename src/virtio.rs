@@ -54,6 +54,7 @@ const ISR_USED_BUFFER: u8 = 1;
 /// it's device-writable (the guest reads from it) vs. device-readable
 /// (the guest wrote it for the device to read). Guaranteed by `try_pop`
 /// to lie entirely within guest RAM.
+#[derive(Debug)]
 pub struct DescBuffer {
     pub addr: u64,
     pub len: u32,
@@ -83,6 +84,16 @@ impl DescChain {
     #[inline]
     pub fn head_index(&self) -> u16 {
         self.head_index
+    }
+
+    /// Test-only: builds a `DescChain` directly from a buffer list,
+    /// bypassing `try_pop`'s own descriptor-table walk entirely. Used by
+    /// property tests in sibling device modules (`virtio_rng.rs`) that
+    /// want to drive a device's `process_chain` with adversarial buffer
+    /// lists without needing a full virtqueue in guest memory to walk.
+    #[cfg(test)]
+    pub fn for_test(buffers: Vec<DescBuffer>) -> Self {
+        Self { head_index: 0, buffers }
     }
 }
 
@@ -271,8 +282,8 @@ pub enum ChainOutcome {
     /// bytes written into device-writable buffers. `drain_queue` pushes
     /// this chain onto the used ring immediately.
     Done(u32),
-    /// The device submitted real async I/O for this chain (DEBTS.md's
-    /// io_uring item) and will complete it itself later, via
+    /// The device submitted real async I/O for this chain (via io_uring)
+    /// and will complete it itself later, via
     /// `VirtioLegacyPci::drain_completions` — `drain_queue` must **not**
     /// push this chain onto the used ring now; pushing it early would
     /// tell the guest data is ready before it actually is.
@@ -1088,6 +1099,7 @@ impl<D: VirtioDeviceOps> Device for VirtioModernPci<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const QUEUE_SIZE: u16 = 4;
     const PFN: u32 = 0x10; // guest address 0x10000, arbitrary but page-aligned
@@ -1259,6 +1271,87 @@ mod tests {
         let mut past = [0xffu8; 4];
         copy_config(&config, 99, &mut past);
         assert_eq!(past, [0; 4], "an offset past the config must read as zeroes");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        /// Generalizes `a_cyclic_chain_terminates_instead_of_looping_forever`,
+        /// `a_descriptor_index_past_the_table_is_rejected`,
+        /// `an_out_of_bounds_buffer_is_rejected_before_any_device_sees_it`,
+        /// and `a_chain_totalling_more_than_guest_ram_is_rejected` into one
+        /// property covering every combination at once: an *entire*
+        /// descriptor table filled with adversarially-generated entries
+        /// (arbitrary addr/len/flags/next per slot, including
+        /// self-referential and forward-referential `next` values, and
+        /// lengths spanning the full `u32` range). Whatever `try_pop`
+        /// produces, it must uphold the two invariants every downstream
+        /// device (`virtio_blk`/`virtio_net`/`virtio_rng`) depends on
+        /// without re-checking themselves: every returned buffer lies
+        /// entirely within guest RAM, and the chain's total length never
+        /// exceeds it. The call itself must also simply return — the
+        /// `for _ in 0..self.size` bound in `try_pop` guarantees
+        /// termination structurally, so this is confirming that guarantee
+        /// holds under generated adversarial input, not discovering
+        /// whether it does.
+        #[test]
+        fn try_pop_never_returns_an_out_of_bounds_or_oversized_chain(
+            descs in proptest::collection::vec(
+                (any::<u64>(), any::<u32>(), any::<u16>(), 0u16..QUEUE_SIZE * 2),
+                QUEUE_SIZE as usize..=QUEUE_SIZE as usize,
+            ),
+            head in 0u16..QUEUE_SIZE,
+        ) {
+            let (mut q, mut mem) = new_queue_and_mem();
+            for (i, (addr, len, flags, next)) in descs.iter().enumerate() {
+                write_desc(&mut mem, i as u16, *addr, *len, *flags, *next);
+            }
+            post_avail(&mut mem, 0, head, 1);
+
+            if let Some(chain) = pop(&mut q, &mem) {
+                let mut total = 0u64;
+                for b in &chain.buffers {
+                    prop_assert!(
+                        mem.in_bounds(b.addr, u64::from(b.len)),
+                        "try_pop handed back a buffer outside guest RAM: {:#x}+{}",
+                        b.addr, b.len
+                    );
+                    total += u64::from(b.len);
+                }
+                prop_assert!(total <= mem.size() as u64, "chain total exceeded guest RAM");
+                prop_assert!(chain.buffers.len() <= QUEUE_SIZE as usize);
+            }
+            // Reaching here at all, for every one of `cases` generated
+            // inputs, is itself part of what's being checked: a hang would
+            // time out the test rather than report a clean failure.
+        }
+
+        /// A chain that *is* fully well-formed (every descriptor points
+        /// inside guest RAM, indices in range, no cycle) is always
+        /// accepted, with every buffer surviving intact and in the right
+        /// order — the positive counterpart to the adversarial property
+        /// above, so a fix that made `try_pop` *too* strict would also be
+        /// caught here, not just a fix that made it too permissive.
+        #[test]
+        fn a_well_formed_chain_is_always_accepted_with_buffers_intact(
+            addrs in proptest::collection::vec(0u64..(MEM_SIZE as u64 - 4096), QUEUE_SIZE as usize),
+            lens in proptest::collection::vec(1u32..4096, QUEUE_SIZE as usize),
+        ) {
+            let (mut q, mut mem) = new_queue_and_mem();
+            for i in 0..QUEUE_SIZE {
+                let last = i == QUEUE_SIZE - 1;
+                let flags = if last { 0 } else { VIRTQ_DESC_F_NEXT };
+                write_desc(&mut mem, i, addrs[i as usize], lens[i as usize], flags, i + 1);
+            }
+            post_avail(&mut mem, 0, 0, 1);
+
+            let chain = pop(&mut q, &mem).expect("a well-formed chain must always be accepted");
+            prop_assert_eq!(chain.buffers.len(), QUEUE_SIZE as usize);
+            for (i, b) in chain.buffers.iter().enumerate() {
+                prop_assert_eq!(b.addr, addrs[i]);
+                prop_assert_eq!(b.len, lens[i]);
+            }
+        }
     }
 }
 

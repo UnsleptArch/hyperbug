@@ -34,8 +34,8 @@ const LSR_THRE_TEMT: u8 = 0x60; // transmit holding reg + shift reg both empty
 const MSR_CTS_DSR_DCD: u8 = 0xb0; // CTS|DSR|DCD asserted: line looks "connected"
 
 /// `HYPERBUG_SERIAL_TRACE=1` dumps every COM1 register access to stderr —
-/// the diagnostic that localized the still-open console-under-ACPI bug
-/// (DEBTS.md item 33). Read **once**, not per access: this sits on the
+/// the diagnostic that localized a past console-under-ACPI bug. Read
+/// **once**, not per access: this sits on the
 /// hottest path in the VMM (one VM exit per console byte in each
 /// direction), and `env::var_os` allocates and takes the process-wide
 /// environment lock on every call.

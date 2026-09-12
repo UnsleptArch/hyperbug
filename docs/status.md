@@ -47,22 +47,58 @@ run `cargo test --release` to reproduce this yourself.
 - **DMA confinement for Python plugins**: an operator-declared bound on
   what a specific plugin's `read_mem`/`write_mem` may reach — not a
   guest-facing IOMMU, and not a general privilege sandbox. See
-  [security.md](security.md) for exactly what it does and doesn't cover.
+  [security.md](security/security.md) for exactly what it does and doesn't cover.
 - **Sandboxed plugins**: isolate a hang/crash from taking down the guest
-  or VMM; not a privilege sandbox (no seccomp/namespace/capability drop).
+  or VMM, and now run under a real seccomp-bpf deny-list (see "Security
+  hardening" below) — but that's a targeted syscall block, not a full
+  privilege sandbox (no namespace/capability drop/UID change).
 - **CPUID curation**: a small number of specific, evidence-checked
   corrections (MONITOR/MWAIT, HTT/thread-count leakage, APIC ID/thread
   count in a couple of leaves) layered on raw host pass-through — not a
   from-scratch curated CPU model.
 - **Snapshot/restore**: solid for a resumed *idle* guest; two known,
   specific correctness gaps remain open (see
-  [security.md](security.md#snapshotrestore-scope)).
+  [security.md](security/security.md#snapshotrestore-scope)).
+
+## Security hardening
+
+A dedicated pass beyond ordinary feature testing — see
+[docs/security/](security/security.md) for the full detail:
+
+- **A consolidated `unsafe`-block audit** covering all 34 blocks in the
+  codebase, not spot checks made while writing the code — one real
+  finding fixed (an inaccurate safety comment on a snapshot-restore
+  path). See [unsafe-audit.md](security/unsafe-audit.md).
+- **Property-based testing** (via `proptest`) on the surfaces that matter
+  most for a tool emulating attacker-reachable management interfaces: PCI
+  config-space traffic, the legacy virtqueue descriptor-chain walk,
+  guest-memory bounds checking, and a couple of narrower parsers. This
+  generalizes what used to be only hand-picked adversarial test cases
+  into generated coverage across each property — see
+  [defendmap.md](security/defendmap.md) for exactly which surfaces have
+  this and which don't yet (virtio-blk/net's own chain processing and the
+  sandboxed-plugin IPC protocol parser are still open).
+- **A real seccomp-bpf deny-list on the sandboxed-plugin subprocess**
+  (`src/seccomp.rs`), blocking `ptrace`, `process_vm_readv`/`writev`, the
+  mount/kernel-module/reboot family, and a few other privilege-escalation
+  primitives — not a full sandbox (no namespace/capability drop), and not
+  yet extended to the main VMM process (which embeds a full CPython
+  interpreter via PyO3, a harder syscall-filtering target).
+- **[defendmap.md](security/defendmap.md)** is the living, per-surface
+  attack-surface map — every place untrusted bytes reach hyperbug's code,
+  and whether that specific surface is defended, partially defended, or
+  still held open. Treat it, not this page, as the authoritative source
+  for exactly what's covered.
 
 ## What's explicitly not done
 
 - No guest-facing IOMMU / DMA remapping.
-- No seccomp/namespace/capability sandboxing of sandboxed-plugin
-  subprocesses.
+- No namespace/capability/UID sandboxing of the sandboxed-plugin
+  subprocess (a seccomp deny-list exists; see above), and no syscall
+  filtering at all on the main VMM process.
+- No coverage-guided fuzzing (`cargo-fuzz`/AFL) — the property-based
+  tests above use a fixed, hand-written strategy, not a fuzzer that
+  discovers new code paths on its own.
 - No authentication or encryption on the live control socket (filesystem
   permissions on the socket path are the only access control).
 - No PCI bridges, multi-function devices, or PCIe ECAM.

@@ -10,7 +10,7 @@
 //! a `Bus` (for the actual reads/writes) and from `PciBus` (which moves the
 //! mapping around as the guest sizes and programs the BAR).
 //!
-//! `Arc<Mutex<...>>`, not `Rc<RefCell<...>>` (DEBTS.md item 11, SMP):
+//! `Arc<Mutex<...>>`, not `Rc<RefCell<...>>` — real multi-vCPU SMP means
 //! multiple vCPU threads can trigger accesses to the same device
 //! concurrently once there's more than one vCPU — the lock is what makes
 //! that safe, and `Arc`/`Mutex` (rather than `Rc`/`RefCell`) is what makes
@@ -87,7 +87,7 @@ pub trait Device: Send {
     /// e.g. a simulated timer, or an async transaction (a doorbell-style
     /// device bridging to something that completes on its own schedule)
     /// whose completion isn't driven by the guest touching a register at
-    /// all (DEBTS.md item 32). Most devices have nothing to do here, hence
+    /// all. Most devices have nothing to do here, hence
     /// the default; a `PyDevice`/`SandboxedPyDevice` whose plugin class
     /// defines `tick()` are the only overrides today.
     fn tick(&mut self) {}

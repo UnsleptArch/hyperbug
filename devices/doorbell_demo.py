@@ -1,4 +1,4 @@
-# Reference device demonstrating `tick()` (DEBTS.md item 32) driving a
+# Reference device demonstrating `tick()` driving a
 # genuinely *asynchronous* completion — the register pattern a real
 # doorbell + circular-buffer transport (host rings a doorbell, the far end
 # processes the request on its own schedule, completion arrives via an

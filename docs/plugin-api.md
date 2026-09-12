@@ -147,7 +147,7 @@ malicious plugin could otherwise just declare "everything." A `read_mem`/
 `write_mem` call outside the declared range raises `OSError`, the same
 exception shape as an out-of-guest-RAM call, even for an address that is
 otherwise perfectly valid guest memory the plugin would reach without the
-restriction. See [security.md](security.md) for the trust model this
+restriction. See [security.md](security/security.md) for the trust model this
 exists within.
 
 ## Sandboxed plugins (`--device-sandboxed` / `--pci-device-sandboxed`)
@@ -171,6 +171,18 @@ the plugin was doing. The cost is a real IPC round trip (not a function
 call) for every register access and DMA call — prefer plain `--device`/
 `--pci-device` for a plugin you trust, and reserve the sandboxed form for
 one you don't (third-party code, or something still being debugged).
+
+The subprocess also runs under a real seccomp-bpf **deny-list**
+(`src/seccomp.rs`), installed between `fork` and `exec`: a specific set
+of syscalls with no legitimate use in a device plugin — `ptrace`,
+`process_vm_readv`/`writev`, the mount/kernel-module/reboot family,
+`bpf`, `perf_event_open`, and a few other privilege-escalation
+primitives — are denied with `EPERM` instead of killing the process, so
+a plugin that hits one gets an ordinary `OSError` it can report. This is
+**not** an allow-list sandbox and does not drop the subprocess's own
+user/filesystem/network privileges — see
+[security.md](security/security.md) for the full trust model this sits
+inside.
 
 ## `import hyperbug` from a plugin file
 
@@ -295,7 +307,7 @@ PCI config space, both virtio PCI transports). It does **not** capture
 both enforced at launch, not silently accepted. The rest of the launch
 configuration (memory size, disks, net, PCI devices) must match what was
 running when the snapshot was taken. See
-[security.md](security.md#snapshotrestore-scope) for the two specific
+[security.md](security/security.md#snapshotrestore-scope) for the two specific
 known-open correctness gaps in this feature before relying on it.
 
 ## Reference plugins

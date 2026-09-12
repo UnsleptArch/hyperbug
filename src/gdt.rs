@@ -129,9 +129,9 @@ mod tests {
     use super::*;
     use kvm_bindings::kvm_sregs;
 
-    // DEBTS.md item 15: this math was reviewed by hand up to a couple of
-    // GiB (default --mem usage) but never exercised near its real
-    // ceiling. These tests actually build the page tables at (and past)
+    // This math was reviewed by hand up to a couple of GiB (default
+    // --mem usage) but never exercised near its real ceiling. These
+    // tests actually build the page tables at (and past)
     // max_identity_map() and check the resulting bytes — no KVM needed,
     // since GuestMemory is just an mmap and setup_page_tables only ever
     // writes to it.

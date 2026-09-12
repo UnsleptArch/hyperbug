@@ -1,8 +1,8 @@
 //! Curates `KVM_GET_SUPPORTED_CPUID`'s raw host pass-through down to a
 //! handful of specific, evidence-based fixes — not a full from-scratch
-//! CPUID (DEBTS.md item 12 stays open as "otherwise uncurated"; this is
+//! CPUID model — everything else is left as raw host pass-through. This is
 //! deliberately narrow, verified via `tests/boot.rs`'s real boot test
-//! rather than trusted by inspection).
+//! rather than trusted by inspection.
 //!
 //! Every leaf/field touched here was checked directly against this host's
 //! own `KVM_GET_SUPPORTED_CPUID` output (a throwaway `kvm-ioctls` program
@@ -31,7 +31,7 @@ const EDX_HTT: u32 = 1 << 28;
 /// `monitor` in `/proc/cpuinfo` — a known KVM/AMD policy, not something
 /// hyperbug controls. The mask was therefore inert here; the actual fix
 /// for that hang was entirely `tty::install_periodic_wakeup`'s SIGALRM
-/// mechanism (see `DEBTS.md` item 29's corrected entry). The mask stays —
+/// mechanism. The mask stays —
 /// masking a feature hyperbug's own `VcpuExit::Hlt` handling isn't built
 /// to make interruptible is still the right defensive choice for an
 /// Intel host or a future KVM policy change — but is documented honestly

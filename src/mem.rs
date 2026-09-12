@@ -210,3 +210,87 @@ impl Drop for GuestMemory {
 // reactor) is sound; concurrent access is serialized by the `Mutex` every
 // holder wraps it in.
 unsafe impl Send for GuestMemory {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The oracle `in_bounds` must match: entirely in `u128` so the
+    /// property test itself can't suffer the exact overflow bug this
+    /// function exists to avoid in the real (`u64`) implementation.
+    fn in_bounds_oracle(addr: u64, len: u64, size: usize) -> bool {
+        u128::from(addr) + u128::from(len) <= size as u128
+    }
+
+    proptest! {
+        /// `in_bounds` must agree with the overflow-safe oracle for every
+        /// `(addr, len)`, including values deliberately chosen near
+        /// `u64::MAX` — exactly the range where a naive `addr + len`
+        /// would wrap and silently defeat the check.
+        #[test]
+        fn in_bounds_matches_the_overflow_safe_oracle(
+            addr in any::<u64>(),
+            len in any::<u64>(),
+        ) {
+            let mem = GuestMemory::new(4096).unwrap();
+            prop_assert_eq!(mem.in_bounds(addr, len), in_bounds_oracle(addr, len, 4096));
+        }
+
+        /// Any address/length pair `in_bounds` accepts must round-trip
+        /// through `write_checked`/`read_checked` with the exact bytes,
+        /// and any pair it rejects must leave `read_checked`/
+        /// `write_checked` reporting failure without touching anything.
+        #[test]
+        fn write_then_read_round_trips_exactly_when_in_bounds(
+            addr in 0u64..8192,
+            data in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut mem = GuestMemory::new(4096).unwrap();
+            let should_fit = mem.in_bounds(addr, data.len() as u64);
+
+            let wrote = mem.write_checked(addr, &data);
+            prop_assert_eq!(wrote, should_fit);
+
+            if should_fit {
+                let mut back = vec![0u8; data.len()];
+                prop_assert!(mem.read_checked(addr, &mut back));
+                prop_assert_eq!(back, data);
+            }
+        }
+
+        /// A `read_checked`/`write_checked` call the bounds check rejects
+        /// must never partially succeed — the destination buffer (for a
+        /// read) is left exactly as it was, not filled with a truncated
+        /// or garbage prefix.
+        #[test]
+        fn an_out_of_bounds_read_leaves_the_destination_untouched(
+            addr in 4096u64..u64::MAX,
+            len in 1usize..64,
+        ) {
+            let mem = GuestMemory::new(4096).unwrap();
+            let sentinel = vec![0xAAu8; len];
+            let mut dst = sentinel.clone();
+            prop_assert!(!mem.read_checked(addr, &mut dst));
+            prop_assert_eq!(dst, sentinel, "an out-of-bounds read must not touch the destination at all");
+        }
+
+        /// `read_u16_checked`/`write_u16_checked`/`write_u32_checked`
+        /// agree with the byte-level primitives they're built from, for
+        /// arbitrary in-bounds addresses.
+        #[test]
+        fn typed_accessors_agree_with_the_byte_level_primitives(
+            addr in 0u64..4090,
+            val in any::<u32>(),
+        ) {
+            let mut mem = GuestMemory::new(4096).unwrap();
+            prop_assert!(mem.write_u32_checked(addr, val));
+            let mut back = [0u8; 4];
+            prop_assert!(mem.read_checked(addr, &mut back));
+            prop_assert_eq!(u32::from_le_bytes(back), val);
+
+            prop_assert!(mem.write_u16_checked(addr, val as u16));
+            prop_assert_eq!(mem.read_u16_checked(addr), Some(val as u16));
+        }
+    }
+}

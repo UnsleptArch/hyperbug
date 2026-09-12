@@ -30,7 +30,7 @@ use crate::virtio_net::{TapDevice, VirtioNet};
 use crate::virtio_rng::VirtioRng;
 use crate::{acpi, serial};
 
-/// Fixed PCI slot assignment (DEBTS.md items 3/4). Every slot here is
+/// Fixed PCI slot assignment. Every slot here is
 /// static regardless of *which* `--disk`/`--net`/`--pci-device` flags are
 /// actually present at runtime, on purpose: `acpi/dsdt.asl`'s `_PRT`
 /// hardcodes GSI routing for these exact slots, so a device landing on a
@@ -84,8 +84,8 @@ pub struct PluginPciDevice {
 }
 
 /// Everything a VM-exit handler needs besides the vCPU that trapped and
-/// guest memory — bundled into one struct behind one `Mutex` (DEBTS.md
-/// item 11, SMP) rather than each bus/device getting its own lock, because
+/// guest memory — bundled into one struct behind one `Mutex` for bus/
+/// dispatch lookups rather than each bus getting its own lock, because
 /// `PciBus::io_out`/`io_in` already need simultaneous `&mut` access to
 /// `MmioBus`/`IoBus` internally; one lock avoids any multi-lock ordering
 /// question entirely. `GuestMemory` stays a *separate* `Arc<Mutex<...>>`
@@ -110,7 +110,7 @@ pub struct SharedState {
     pub msi_devfns: Vec<(u32, u8)>,
     pub control: Option<ControlServer>,
     /// Every hyperbug-owned virtio device that can serialize its protocol
-    /// state (DEBTS.md item 8), in the exact order `Machine::build`
+    /// state for snapshot/restore, in the exact order `Machine::build`
     /// constructs them: disks, then net if present, then rng. `snapshot.
     /// rs`'s `save_to_file`/`load_from_file` rely on that order matching
     /// on both sides, since a fresh launch reconstructs it identically
@@ -209,7 +209,7 @@ impl Machine {
 
         let plugins = Self::add_pci_plugins(args, vm, guest_mem, irqs, &mut pci_bus)?;
 
-        // DEBTS.md item 20: live VM control — peek/poke a *running*
+        // Live VM control — peek/poke a *running*
         // guest's memory and registers from outside the process, not just
         // launch/wait/stop. Optional: only opened if asked for.
         let control = match args.control_socket.as_deref() {

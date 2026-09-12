@@ -31,14 +31,14 @@ class DmaDemoDevice(PciDevice):
     bar_sizes = [0x10]
     # Must be a legacy ISA IRQ (1-15) actually routed to this slot's _PRT
     # entry under ACPI, or trusted directly via the raw PCI config-space
-    # `interrupt_line` byte otherwise (see DEBTS.md item 3) — this example
+    # `interrupt_line` byte otherwise — this example
     # picks 9, a commonly-free legacy IRQ, and assumes whoever wires this
     # device up with `--pci-device` has picked a slot/IRQ pairing that
     # doesn't collide with anything else on the bus. Also the fallback
     # `raise_irq()` uses if `msi_capable` below is true but the guest
     # hasn't (or can't) enable MSI.
     interrupt_line = 9
-    # DEBTS.md item 2: opts into a real PCI MSI capability. A guest driver
+    # Opts into a real PCI MSI capability. A guest driver
     # that enables it makes `raise_irq()` deliver via `KVM_SIGNAL_MSI`
     # instead of the legacy `interrupt_line` pulse — transparent to this
     # device, which always just calls `raise_irq()` either way.

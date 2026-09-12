@@ -9,7 +9,7 @@
 //! being rejected.
 //!
 //! **IN/OUT (read/write) requests go through real io_uring**, submitted
-//! non-blocking and completed asynchronously (DEBTS.md's io_uring item):
+//! non-blocking and completed asynchronously:
 //! `process_chain` returns `ChainOutcome::Pending` immediately after
 //! submission rather than blocking the calling thread (a vCPU thread on
 //! the old synchronous notify path, or the reactor thread via ioeventfd)
@@ -438,7 +438,7 @@ impl VirtioDeviceOps for VirtioBlk {
         let Some((header_buf, data_buffers)) = rest.split_first() else {
             return ChainOutcome::Done(0);
         };
-        // DEBTS.md item 6: don't just trust positional convention — a
+        // Don't just trust positional convention — a
         // spec-compliant driver that (legally) flagged these differently
         // would otherwise be silently misread instead of rejected clearly.
         if header_buf.device_writable || !status_buf.device_writable {
@@ -667,7 +667,7 @@ mod tests {
         s
     }
 
-    /// DEBTS.md item 7: WRITE_ZEROES/DISCARD are real disk I/O, not a stub
+    /// WRITE_ZEROES/DISCARD are real disk I/O, not a stub
     /// that reports success without touching anything — this drives
     /// `zero_segments` exactly the way `process_chain` would (a guest
     /// buffer holding a real `struct virtio_blk_discard_write_zeroes`) and

@@ -76,3 +76,74 @@ impl VirtioDeviceOps for VirtioRng {
         ChainOutcome::Done(written)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::DescBuffer;
+    use proptest::prelude::*;
+
+    const MEM_SIZE: u64 = 4096;
+
+    /// Feeds `process_chain` a deliberately adversarial chain — buffers
+    /// with arbitrary addresses/lengths (including out-of-guest-RAM and
+    /// zero-length ones) and an arbitrary `device_writable` flag, the same
+    /// shape a malformed or hostile descriptor chain would have if it ever
+    /// reached this far. In real use `try_pop` already guarantees every
+    /// buffer lies within guest RAM before a device ever sees it, so this
+    /// test is deliberately *not* relying on that guarantee — it checks
+    /// `process_chain` itself degrades safely (no panic, no reported
+    /// `written` count exceeding what could actually have been written)
+    /// even if that upstream guarantee were somehow bypassed.
+    fn arbitrary_buffer() -> impl Strategy<Value = DescBuffer> {
+        (any::<u64>(), any::<u32>(), any::<bool>())
+            .prop_map(|(addr, len, device_writable)| DescBuffer { addr, len, device_writable })
+    }
+
+    proptest! {
+        #[test]
+        fn process_chain_never_panics_on_an_adversarial_chain(
+            buffers in proptest::collection::vec(arbitrary_buffer(), 0..8),
+        ) {
+            let mut mem = GuestMemory::new(MEM_SIZE as usize).unwrap();
+            let chain = DescChain::for_test(buffers);
+            let mut rng = VirtioRng::new();
+
+            let ChainOutcome::Done(written) = rng.process_chain(0, &mut mem, &chain) else {
+                prop_assert!(false, "virtio-rng never defers completion");
+                unreachable!();
+            };
+
+            // Every byte reported written had to have gone through a
+            // successful `write_checked` into a device-writable buffer —
+            // which is itself bounds-checked — so `written` can never
+            // exceed the total length of the device-writable buffers in
+            // the chain, adversarial or not.
+            let max_possible: u64 = chain
+                .buffers
+                .iter()
+                .filter(|b| b.device_writable)
+                .map(|b| u64::from(b.len))
+                .sum();
+            prop_assert!(u64::from(written) <= max_possible);
+        }
+
+        /// A chain built entirely from in-bounds, device-writable buffers
+        /// (the realistic case `try_pop` actually produces) gets fully
+        /// filled: `written` equals the total requested length.
+        #[test]
+        fn a_well_formed_chain_is_filled_completely(
+            addr in 0u64..(MEM_SIZE - 256),
+            len in 1u32..256,
+        ) {
+            let mut mem = GuestMemory::new(MEM_SIZE as usize).unwrap();
+            let chain = DescChain::for_test(vec![DescBuffer { addr, len, device_writable: true }]);
+            let mut rng = VirtioRng::new();
+            let ChainOutcome::Done(written) = rng.process_chain(0, &mut mem, &chain) else {
+                prop_assert!(false, "virtio-rng never defers completion");
+                unreachable!();
+            };
+            prop_assert_eq!(written, len);
+        }
+    }
+}

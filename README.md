@@ -42,7 +42,9 @@ with VM("bzImage", mem_mb=512, disks=["disk.img"], net=True) as vm:
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | How hyperbug is put together internally: process/thread model, boot path, device model, design rationale, and hard-won lessons from past bugs. |
 | [docs/plugin-api.md](docs/plugin-api.md) | The full `Device`/`PciDevice` plugin ABI, the `hyperbug` Python package (`VM`, live control, snapshot/restore), and reference plugins. |
-| [docs/security.md](docs/security.md) | Trust boundaries, what's enforced against a hostile guest or an untrusted plugin, and what's explicitly out of scope today. |
+| [docs/security/security.md](docs/security/security.md) | Trust boundaries, what's enforced against a hostile guest or an untrusted plugin, and what's explicitly out of scope today. |
+| [docs/security/defendmap.md](docs/security/defendmap.md) | The concrete attack-surface map: every place untrusted bytes reach hyperbug's code, and whether that surface is defended, partially defended, or still held open. |
+| [docs/security/unsafe-audit.md](docs/security/unsafe-audit.md) | A consolidated review of every `unsafe` block in the codebase, file by file. |
 | [docs/dev-guide.md](docs/dev-guide.md) | Building, testing (including the real KVM-backed boot tests), debugging techniques, and contribution conventions. |
 | [docs/cli-reference.md](docs/cli-reference.md) | Every CLI flag and exit code. |
 | [docs/status.md](docs/status.md) | What's verified, what's narrower than it looks, what's not done. |

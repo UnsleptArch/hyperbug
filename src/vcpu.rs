@@ -20,9 +20,9 @@ use crate::{pci, serial, tty};
 
 /// The classic QEMU/Bochs debug-console port: a raw byte straight to the
 /// host's stdout, independent of the serial console. Load-bearing as a
-/// diagnostic — it's how the still-open console-under-ACPI bug (DEBTS.md
-/// item 33) was finally instrumented, precisely because it doesn't share
-/// any code with the path under suspicion.
+/// diagnostic — it's how a past console-under-ACPI bug was finally
+/// instrumented and root-caused, precisely because it doesn't share any
+/// code with the path that was under suspicion.
 const DEBUG_CONSOLE_PORT: u16 = 0xe9;
 
 /// How long an application processor waits between `KVM_GET_MP_STATE`
@@ -274,8 +274,8 @@ impl Runner<'_> {
     ) {
         // A control connection can send a command at any time. Reports
         // vCPU 0's registers regardless of which vCPU is "interesting" at
-        // the moment — a known limitation for a multi-vCPU guest (DEBTS.md
-        // item 20). Deliberately not moved to the reactor: a live vCPU's
+        // the moment — a known limitation for a multi-vCPU guest.
+        // Deliberately not moved to the reactor: a live vCPU's
         // registers can only safely be read from that vCPU's own thread.
         if has_control {
             let mut state = self.env.shared.lock().unwrap();

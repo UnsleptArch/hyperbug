@@ -1,4 +1,4 @@
-//! Live VM control (DEBTS.md item 20): a Unix domain socket the running
+//! Live VM control: a Unix domain socket the running
 //! VM listens on, so a Python script — or anything else — can inspect and
 //! poke a *live* guest while it runs (peek/poke memory, read and write
 //! vCPU registers), the way IntelCommander's `gdbstub.py`/`Rehost` already
@@ -30,7 +30,7 @@
 //!   Read-modify-write — naming one field leaves the other seventeen
 //!   alone.
 //! - `snapshot <path>` -> `OK` or `ERR <message>`. Serializes the whole
-//!   machine (DEBTS.md item 8, `snapshot.rs`) to `path` — vCPU state via
+//!   machine (`snapshot.rs`) to `path` — vCPU state via
 //!   this same `vcpu`, guest memory, and every snapshotted device's
 //!   protocol state. See `snapshot.rs`'s module doc comment for exactly
 //!   what's covered and what isn't (single vCPU, no Python device plugin

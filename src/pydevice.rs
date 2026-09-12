@@ -51,14 +51,16 @@ use crate::pci::{NUM_BARS, PciDevice};
 /// guest posted, write a response into guest-supplied buffers) and raise
 /// its own interrupt spontaneously — a timer firing, an external event
 /// arriving — not only synchronously from inside `write()`.
-// Not `unsendable` (DEBTS.md item 11, SMP): `Arc<Mutex<...>>`/
+// Not `unsendable` (real multi-vCPU SMP means multiple OS threads can
+// call into the same device plugin): `Arc<Mutex<...>>`/
 // `Arc<AtomicBool>` are genuinely `Send`, so this can safely cross the
 // per-vCPU threads that might call into the same device plugin — PyO3's
 // GIL still serializes the actual Python execution regardless of which
-// OS thread holds it, exactly as designed. This incidentally closes
-// DEBTS.md item 34 (a `RuntimeError: ... is unsendable, but is being
-// dropped on another thread` seen in tests) — that class of problem is
-// specific to `unsendable` types, and this isn't one.
+// OS thread holds it, exactly as designed. This incidentally avoids a
+// `RuntimeError: ... is unsendable, but is being dropped on another
+// thread` that a prior `unsendable` version of this type hit in tests —
+// that class of problem is specific to `unsendable` types, and this
+// isn't one.
 #[pyclass]
 struct HyperbugCtx {
     mem: Arc<Mutex<GuestMemory>>,
@@ -229,7 +231,7 @@ pub struct PyDevice {
     /// vCPU-loop iteration (see `vcpu::poll_host`) for logic that needs to
     /// run independent of any register access — e.g. a simulated timer, or
     /// an async transaction whose completion isn't driven by the guest
-    /// touching a register at all (DEBTS.md item 32).
+    /// touching a register at all.
     tick_fn: Option<Py<PyAny>>,
     pci: PyPciIdentity,
     irq_pending: Arc<AtomicBool>,
@@ -238,14 +240,16 @@ pub struct PyDevice {
     tick_error_count: u64,
 }
 
-/// DEBTS.md item 9 (partial): a systematically-buggy device (every call
+/// A systematically-buggy device (every call
 /// raises) used to `eprintln!` unconditionally on every single guest
 /// access — a driver polling that register in a tight loop could flood
 /// stderr and measurably slow the VM. Logs the first few occurrences in
 /// full, then falls back to a periodic count so the problem is still
-/// visible without the flood. Doesn't address the *other* half of that
-/// debt item (an infinite loop or blocking call inside a plugin still
-/// hangs its vCPU thread forever, unbounded).
+/// visible without the flood. Doesn't address a plugin that hangs
+/// outright rather than raising (an infinite loop or blocking call inside
+/// a plugin still hangs its vCPU thread forever, unbounded, for this
+/// in-process loader) — see `pydevice_proc.rs`'s sandboxed loader for the
+/// real fix to that.
 ///
 /// **A real per-call timeout was attempted and reverted — a verified
 /// negative result, not just an untried idea, so a future session
@@ -506,7 +510,7 @@ mod tests {
     }
 
     /// Exercises `devices/doorbell_demo.py` — the reference doorbell +
-    /// ring-buffer device added alongside `tick()` (DEBTS.md item 32) to
+    /// ring-buffer device added alongside `tick()` to
     /// prove out the register pattern a real bridged async transport
     /// needs (submit, then a completion arriving on its own schedule via
     /// `raise_irq()`, not synchronously inside the triggering `write()`)
@@ -558,9 +562,9 @@ mod tests {
         assert_eq!(u32::from_le_bytes(status), 0, "draining both results should clear every status bit");
     }
 
-    /// Exercises `devices/dma_demo.py` end-to-end — DEBTS.md item 32
-    /// flagged that `HyperbugCtx`'s `read_mem`/`write_mem`/`raise_irq` were
-    /// wired up and clean-building but never actually exercised by a real
+    /// Exercises `devices/dma_demo.py` end-to-end, since `HyperbugCtx`'s
+    /// `read_mem`/`write_mem`/`raise_irq` had once only been wired up and
+    /// clean-building without ever actually being exercised by a real
     /// plugin. This drives the example device exactly the way a guest
     /// driver would (poke a buffer into "guest RAM", tell the device where
     /// it is via register writes, ask it to act, read the result back from
@@ -630,9 +634,9 @@ mod tests {
     /// A plugin that *does* define `tick()` gets called once per
     /// `Device::tick()` — driven here the same way `vcpu::poll_host` drives
     /// it, once per (simulated) loop iteration — and can use it to raise
-    /// its own interrupt independent of any register access (DEBTS.md item
-    /// 32: "nothing currently calls back into a Python device without the
-    /// guest touching it first").
+    /// its own interrupt independent of any register access — this is what
+    /// makes it possible for a Python device to be called back into
+    /// without the guest touching it first.
     #[test]
     fn tick_calls_the_plugins_tick_method_which_can_raise_its_own_irq() {
         let dir = std::env::temp_dir().join(format!("hyperbug-tick-test-{}", std::process::id()));

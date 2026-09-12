@@ -1,10 +1,10 @@
-// DEBTS.md item 17: nothing enforced that `src/dsdt.aml` (the compiled
-// binary actually embedded via `include_bytes!`) stayed in sync with
-// `acpi/dsdt.asl` (the checked-in source). If `iasl` is installed, this
-// recompiles the source into a scratch location and compares the bytes,
-// failing the build on a mismatch. If `iasl` isn't installed, this is a
-// no-op — hyperbug's own `cargo build` doesn't need it, only editing the
-// DSDT does (see docs/dev-guide.md's toolchain notes).
+// Enforces that `src/dsdt.aml` (the compiled binary actually embedded via
+// `include_bytes!`) stays in sync with `acpi/dsdt.asl` (the checked-in
+// source) — nothing else in the build catches that drift. If `iasl` is
+// installed, this recompiles the source into a scratch location and
+// compares the bytes, failing the build on a mismatch. If `iasl` isn't
+// installed, this is a no-op — hyperbug's own `cargo build` doesn't need
+// it, only editing the DSDT does (see docs/dev-guide.md's toolchain notes).
 
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +17,7 @@ fn main() {
 
     if Command::new("iasl").arg("-v").output().is_err() {
         println!(
-            "cargo:warning=iasl not found — skipping DSDT source/binary drift check (DEBTS.md item 17); \
+            "cargo:warning=iasl not found — skipping DSDT source/binary drift check; \
              install `acpica` to enable it"
         );
         return;

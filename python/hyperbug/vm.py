@@ -97,8 +97,8 @@ class PciDeviceSpec:
 
 
 class ControlConnection:
-    """A live connection to a *running* guest's `--control-socket` — DEBTS.md
-    item 20: peek/poke a VM's memory and registers while it's actually
+    """A live connection to a *running* guest's `--control-socket`: peek/poke
+    a VM's memory and registers while it's actually
     running, not just launch/wait/stop. See `control.rs` on the Rust side
     for the wire protocol this speaks (plain hex-encoded text lines);
     get one via `VM.connect_control()` rather than constructing directly.
@@ -148,7 +148,7 @@ class ControlConnection:
 
     def snapshot(self, path: str | Path) -> None:
         """Serializes the whole running guest (vCPU state, memory, and
-        hyperbug's own device state — see DEBTS.md item 39) to `path`.
+        hyperbug's own device state) to `path`.
         Reload it later with `VM(restore=path, ...)`. Raises `OSError` on
         failure (e.g. an unwritable path)."""
         self._command(f"snapshot {path}")
@@ -208,7 +208,7 @@ class VM:
     devices: list[DeviceSpec] = field(default_factory=list)
     pci_devices: list[PciDeviceSpec] = field(default_factory=list)
     #: `--device-sandboxed`: same `DeviceSpec` shape as `devices`, but each
-    #: plugin runs in its own subprocess (DEBTS.md item 9) instead of
+    #: plugin runs in its own subprocess instead of
     #: in-process — a hung or crashed plugin gets killed rather than
     #: stalling or taking down the whole guest.
     sandboxed_devices: list[DeviceSpec] = field(default_factory=list)
@@ -220,18 +220,18 @@ class VM:
     #: of the legacy I/O-BAR one every other virtio device here still uses
     #: (`--rng-modern`).
     rng_modern: bool = False
-    #: Path for a live-control Unix socket (DEBTS.md item 20) — set this
+    #: Path for a live-control Unix socket — set this
     #: and call `connect_control()` after `start()` to peek/poke the
     #: running guest's memory and registers. `None` (the default) means
     #: no control socket at all.
     control_socket: str | Path | None = None
-    #: Number of vCPUs (DEBTS.md item 11) — real multi-vCPU execution, not
+    #: Number of vCPUs — real multi-vCPU execution, not
     #: a fake reported count: vCPU 0 boots the kernel directly, vCPUs
     #: 1..N come up through a genuine INIT-SIPI-SIPI sequence. 1 (the
     #: default) matches every prior single-vCPU behavior exactly.
     smp: int = 1
-    #: Path to a snapshot written by `ControlConnection.snapshot()`
-    #: (DEBTS.md item 39). When set, boots from the snapshot instead of
+    #: Path to a snapshot written by `ControlConnection.snapshot()`.
+    #: When set, boots from the snapshot instead of
     #: `kernel`/`initrd` — `kernel` is still required by the CLI parser
     #: but unused. Single-vCPU only; not combinable with `devices`/
     #: `pci_devices` (Python plugin state isn't part of a snapshot).
@@ -327,8 +327,8 @@ class VM:
 
     def connect_control(self, timeout: float = 5.0) -> ControlConnection:
         """Connects to this VM's `--control-socket` (must have been set
-        before `start()`) for live memory/register access — DEBTS.md item
-        20. Waits up to `timeout` seconds for the socket file to appear,
+        before `start()`) for live memory/register access. Waits up to
+        `timeout` seconds for the socket file to appear,
         since it's created once hyperbug binds it, shortly after `start()`
         returns but not necessarily before this is called.
         """

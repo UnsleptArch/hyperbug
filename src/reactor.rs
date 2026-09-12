@@ -1,6 +1,6 @@
 //! A real, event-driven reactor for the host-side async inputs that used
-//! to be polled once per vCPU-loop iteration (DEBTS.md's event-loop
-//! item): stdin keystrokes and TAP packets. Runs on its own dedicated OS
+//! to be polled once per vCPU-loop iteration: stdin keystrokes and TAP
+//! packets. Runs on its own dedicated OS
 //! thread, blocking in a genuine `epoll_wait` — zero overhead while idle,
 //! and an immediate wakeup the moment real data is available, instead of
 //! a latency bounded only by how often the vCPU loop happened to poll
@@ -17,10 +17,10 @@
 //! only safely be read from that vCPU's own thread (KVM vCPU fds aren't
 //! safe to use concurrently from a different thread), and a Python
 //! device's own arbitrary background thread has no fd for `epoll` to wait
-//! on in the first place — see DEBTS.md for the full reasoning.
+//! on in the first place.
 //!
-//! Also owns the other half of `KVM_IOEVENTFD` (DEBTS.md's event-loop
-//! item): once a virtio device's notify register gets a real KVM
+//! Also owns the other half of `KVM_IOEVENTFD`: once a virtio device's
+//! notify register gets a real KVM
 //! ioeventfd binding (`pci.rs`'s `rebind_ioevents`, at BAR-assignment
 //! time), the guest's own queue-kick write never reaches this process as
 //! a VM exit at all — KVM signals the eventfd in-kernel instead. This

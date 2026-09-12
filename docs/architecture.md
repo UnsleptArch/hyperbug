@@ -5,7 +5,7 @@ process/thread model, the boot path, the device model, and the reasoning
 behind the major design decisions. For the day-to-day "how do I build/test
 this" workflow, see [dev-guide.md](dev-guide.md). For the plugin-facing
 contract, see [plugin-api.md](plugin-api.md). For the trust model and known
-attack surface, see [security.md](security.md).
+attack surface, see [security.md](security/security.md).
 
 ## What hyperbug is
 
@@ -186,7 +186,12 @@ it exposes a generic MMIO/PCI-BAR-mapped register ABI (`read`/`write`,
 optional `tick()`, optional PCI identity attributes) that a plugin
 implements in Python, either loaded in-process via PyO3 (`pydevice.rs`) or
 in its own subprocess (`pydevice_proc.rs`, `--*-sandboxed`) for isolation
-from a plugin that hangs or crashes.
+from a plugin that hangs or crashes. A sandboxed plugin's subprocess is
+additionally launched under a real seccomp-bpf deny-list (`seccomp.rs`,
+installed via `Command::pre_exec` between `fork` and `exec`) blocking a
+targeted set of privilege-escalation syscalls — see
+[security.md](security/security.md) for exactly what it does and
+doesn't cover.
 
 ## Snapshot/restore
 
@@ -198,7 +203,7 @@ file, triggered live via the control socket's `snapshot <path>` command.
 deliberately narrow: single-vCPU only, and no Python plugin state (a
 plugin's own Python object graph isn't part of the format) — both checked
 and refused at launch rather than silently producing a broken restore. See
-[security.md](security.md) and the dev-guide's testing section for the
+[security.md](security/security.md) and the dev-guide's testing section for the
 two known-open edge cases (a task woken immediately post-restore, and a
 virtio-blk request genuinely in flight through io_uring at snapshot time).
 

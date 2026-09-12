@@ -1,6 +1,6 @@
 //! A real error type for hyperbug's core (`run()`/`run_vcpu`), replacing
 //! the `panic!`/`std::process::exit` scattered through the pre-refactor
-//! code — see DEBTS.md's error-model item. `main.rs` (a genuine CLI
+//! code. `main.rs` (a genuine CLI
 //! binary) is still allowed to translate a returned `Err` into an actual
 //! process exit; nothing below `run()` does that itself, which is what
 //! actually makes `run()` embeddable (a caller's process survives a
