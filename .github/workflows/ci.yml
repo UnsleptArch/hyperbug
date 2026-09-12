@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # GitHub's Ubuntu runners have /dev/kvm and a real kernel image
+    # already present — both of `tests/boot.rs`'s real boot tests need
+    # exactly that (see DEBTS.md item 23), not a special CI-only setup.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # iasl (for the DSDT build.rs check + acpi.rs's own iasl-round-trip
+      # tests) and busybox (for tests/boot.rs's initramfs) aren't on the
+      # runner image by default. Neither is required for `cargo build` —
+      # see README's dependency table — but both are needed for the full
+      # test suite to actually exercise anything rather than skip.
+      - name: install iasl + busybox
+        run: sudo apt-get update && sudo apt-get install -y acpica-tools busybox-static
+
+      # /dev/kvm exists on GitHub's Ubuntu runners (nested virtualization
+      # is enabled) but isn't world-writable by default the way it is on
+      # the dev machine this project was built on — same permissions fix
+      # every KVM-using CI workflow needs (e.g. the Android emulator
+      # GitHub Action does the same thing).
+      - name: enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: build
+        run: cargo build --release
+
+      - name: clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      # Includes tests/boot.rs's two real boot tests — an actual guest
+      # boots under KVM here, not just unit tests. Each individually
+      # checks its own prerequisites (kernel image, busybox) and skips
+      # rather than fails if either is somehow still missing, so a
+      # runner-image change that silently drops one doesn't break CI —
+      # it just stops testing what it used to, which is its own kind of
+      # regression worth noticing in the job log rather than from a
+      # failure.
+      - name: test
+        run: cargo test --release -- --nocapture

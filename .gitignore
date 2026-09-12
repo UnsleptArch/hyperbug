@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+.claude
+CLAUDE.md
+/DEBTS.md
+__pycache__/
+/demo
