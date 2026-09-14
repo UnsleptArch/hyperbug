@@ -35,6 +35,11 @@ class ExitCode(enum.IntEnum):
     REQUESTED_REBOOT = 10
     TRIPLE_FAULT = 11
     HALTED = 12
+    #: The guest was live-migrated away via a control connection's
+    #: `migrate(host, port)` — not a failure; the guest is simply running
+    #: in a different (destination) process now. See `migrate()` on
+    #: `ControlConnection`.
+    MIGRATED_AWAY = 13
 
 
 #: Exit codes hyperbug itself uses for "refused to even start" (bad CLI
@@ -96,6 +101,34 @@ class PciDeviceSpec:
         return arg
 
 
+@dataclass(frozen=True)
+class I2cDeviceSpec:
+    """An `--i2c-device` entry: a Python `hyperbug.device.I2cDevice`
+    target attached to hyperbug's single virtual I2C bus at a fixed
+    7-bit address. The adapter itself (a real `virtio-i2c` device) is
+    created automatically the moment any `I2cDeviceSpec` is present."""
+
+    path: str | Path
+    class_name: str
+    addr: int
+
+    def to_arg(self) -> str:
+        return f"{self.path}:{self.class_name}:{self.addr:#x}"
+
+
+@dataclass(frozen=True)
+class GpioDeviceSpec:
+    """A `--gpio-device` entry: a Python `hyperbug.device.GpioBank`
+    attached as its own independent virtual GPIO bank (its own real
+    `virtio-gpio` PCI adapter, unlike `I2cDeviceSpec`'s shared bus)."""
+
+    path: str | Path
+    class_name: str
+
+    def to_arg(self) -> str:
+        return f"{self.path}:{self.class_name}"
+
+
 class ControlConnection:
     """A live connection to a *running* guest's `--control-socket`: peek/poke
     a VM's memory and registers while it's actually
@@ -153,6 +186,77 @@ class ControlConnection:
         failure (e.g. an unwritable path)."""
         self._command(f"snapshot {path}")
 
+    def reset_device(self, mmio_base: int | None = None, pci_device_number: int | None = None) -> None:
+        """Calls a live `--device`/`--pci-device` plugin's `reset()`
+        method, if it defines one (a no-op otherwise), without touching
+        its code. Select the device by exactly one of `mmio_base` (the
+        fixed address it was loaded at) or `pci_device_number` (the
+        number passed to `--pci-device`/`--pci-device-sandboxed`, not the
+        internal devfn). Raises `OSError` if no matching device is
+        attached."""
+        selector = _device_selector(mmio_base, pci_device_number)
+        self._command(f"reset_device {selector}")
+
+    def reload_device(self, mmio_base: int | None = None, pci_device_number: int | None = None) -> None:
+        """Re-reads a live plugin's file from disk and swaps in a fresh
+        instance in place — the same path/class/DMA-range/resource-limits
+        it was originally loaded with, just re-instantiated — without
+        restarting the guest or changing the device's address. See
+        `reset_device` for how to select the device. Raises `OSError` if
+        no matching device is attached, or (for a `--pci-device`) if the
+        reloaded plugin's PCI identity (vendor/device/class/BAR sizes/
+        IRQ/MSI) doesn't exactly match what's already registered — the
+        PCI bus caches that identity once and has no way to notice it
+        changed later, so a mismatched reload is refused outright rather
+        than silently desyncing the guest's view of the device."""
+        selector = _device_selector(mmio_base, pci_device_number)
+        self._command(f"reload_device {selector}")
+
+    def fork(self, new_control_socket: str | Path) -> int:
+        """Clones the *live, running* guest into a brand new, fully
+        independent hyperbug process, without disturbing this one at all.
+        Guest memory is shared via real copy-on-write (no serialize/copy
+        step — this is why fork is dramatically cheaper than
+        `snapshot()` + `VM(restore=...)` for the same effect), so the
+        child resumes from exactly this instant. Returns the child
+        process's real PID. Connect to the child's own new control
+        socket (it appears shortly after this call returns, same as any
+        `--control-socket` launch) to interact with it.
+
+        Scope, enforced on the Rust side, not just documented: single-vCPU
+        only; no `--device`/`--pci-device` plugins of any kind attached;
+        and not combinable with `--record`/`--replay`/`--gdb-stub`/
+        `--trace-file`. Raises `OSError` if this launch doesn't qualify,
+        or if the reactor thread doesn't quiesce in time (fails closed —
+        never forks a guest whose background I/O thread might be mid-lock)."""
+        return int(self._command(f"fork {new_control_socket}"))
+
+    def migrate(self, dest_addr: str) -> None:
+        """Live-migrates the *running* guest to a separate hyperbug
+        process listening at `dest_addr` (`"host:port"`) via
+        `VM(migrate_listen=dest_addr)`. Streams vCPU state, guest memory,
+        and device state over a plain TCP connection to it, then retires
+        this process's own guest (`wait()` will return
+        `ExitCode.MIGRATED_AWAY`) — unlike `fork()`, nothing is left
+        running in this process afterward. Connect to the destination the
+        same way as any other control socket once its own launch's
+        `control_socket` (if any) is reachable.
+
+        Raises `OSError` if this launch doesn't qualify (multi-vCPU, any
+        `devices`/`pci_devices` attached, or `--record`/`--replay`/
+        `--gdb-stub`/`--trace-file` in use — see `migrate.rs`'s own scope
+        limits), if the destination can't be reached, or if the reactor
+        thread can't be quiesced in time (fails closed: never migrates a
+        guest whose background I/O thread might be mid-lock). A failed
+        attempt leaves this guest running untouched — always safe to
+        retry.
+
+        **No encryption or authentication on the migration stream** — see
+        `migrate.rs`'s own module doc comment. Fine on a trusted network;
+        wrap it in your own tunnel (SSH, a private VPC) for anything
+        else."""
+        self._command(f"migrate {dest_addr}")
+
     def close(self) -> None:
         self._file.close()
         self._sock.close()
@@ -170,6 +274,17 @@ class ControlConnection:
         if reply.startswith("ERR"):
             raise OSError(reply.removeprefix("ERR").strip())
         return reply.removeprefix("OK").strip()
+
+
+def _device_selector(mmio_base: int | None, pci_device_number: int | None) -> str:
+    """Builds the `<mmio|pci> <value>` selector `reset_device`/
+    `reload_device` expect — exactly one of `mmio_base`/`pci_device_number`
+    must be given."""
+    if (mmio_base is None) == (pci_device_number is None):
+        raise ValueError("pass exactly one of mmio_base or pci_device_number")
+    if mmio_base is not None:
+        return f"mmio {mmio_base:#x}"
+    return f"pci {pci_device_number}"
 
 
 def _default_binary() -> str:
@@ -214,6 +329,13 @@ class VM:
     sandboxed_devices: list[DeviceSpec] = field(default_factory=list)
     #: `--pci-device-sandboxed`: the `pci_devices` equivalent.
     sandboxed_pci_devices: list[PciDeviceSpec] = field(default_factory=list)
+    #: `--i2c-device`: target devices on hyperbug's single virtual I2C
+    #: bus. Attaches a real `virtio-i2c` adapter automatically the moment
+    #: this is non-empty; empty (the default) means no I2C bus at all.
+    i2c_devices: list[I2cDeviceSpec] = field(default_factory=list)
+    #: `--gpio-device`: each entry attaches its own independent virtual
+    #: GPIO bank (own real `virtio-gpio` PCI adapter).
+    gpio_devices: list[GpioDeviceSpec] = field(default_factory=list)
     disks: list[str | Path] = field(default_factory=list)
     net: bool = False
     #: Attaches virtio-rng over the modern virtio 1.0 PCI transport instead
@@ -236,6 +358,15 @@ class VM:
     #: but unused. Single-vCPU only; not combinable with `devices`/
     #: `pci_devices` (Python plugin state isn't part of a snapshot).
     restore: str | Path | None = None
+    #: `<host>:<port>` to listen on for an incoming live migration
+    #: (`--migrate-listen`) instead of booting `kernel`/`initrd` normally.
+    #: `kernel` is still required by the CLI parser but unused, same as
+    #: `restore` — mutually exclusive with it. Blocks until a separate
+    #: hyperbug process's `ControlConnection.migrate()` connects; the rest
+    #: of this `VM`'s configuration (`mem_mb`, `disks`, `net`,
+    #: `rng_modern`) must match the source guest's exactly. Single-vCPU
+    #: only, no `devices`/`pci_devices` — same restrictions as `restore`.
+    migrate_listen: str | None = None
 
     _process: subprocess.Popen | None = field(default=None, init=False, repr=False)
     _capture_output: bool = field(default=False, init=False, repr=False)
@@ -252,6 +383,12 @@ class VM:
     def add_sandboxed_pci_device(self, path: str | Path, class_name: str, device_number: int) -> None:
         self.sandboxed_pci_devices.append(PciDeviceSpec(path, class_name, device_number))
 
+    def add_i2c_device(self, path: str | Path, class_name: str, addr: int) -> None:
+        self.i2c_devices.append(I2cDeviceSpec(path, class_name, addr))
+
+    def add_gpio_device(self, path: str | Path, class_name: str) -> None:
+        self.gpio_devices.append(GpioDeviceSpec(path, class_name))
+
     def _build_args(self) -> list[str]:
         args = [self.binary or _default_binary(), "--kernel", str(self.kernel), "--mem", str(self.mem_mb)]
         if self.initrd is not None:
@@ -260,6 +397,8 @@ class VM:
             args += ["--cmdline", self.cmdline]
         if self.restore is not None:
             args += ["--restore", str(self.restore)]
+        if self.migrate_listen is not None:
+            args += ["--migrate-listen", self.migrate_listen]
         for d in self.devices:
             args += ["--device", d.to_arg()]
         for d in self.pci_devices:
@@ -268,6 +407,10 @@ class VM:
             args += ["--device-sandboxed", d.to_arg()]
         for d in self.sandboxed_pci_devices:
             args += ["--pci-device-sandboxed", d.to_arg()]
+        for d in self.i2c_devices:
+            args += ["--i2c-device", d.to_arg()]
+        for d in self.gpio_devices:
+            args += ["--gpio-device", d.to_arg()]
         for disk in self.disks:
             args += ["--disk", str(disk)]
         if self.net:

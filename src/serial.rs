@@ -5,8 +5,25 @@
 //! state and every userspace write() fails with -EIO). Also models RX
 //! (host stdin -> guest), so this is a real two-way console, not just a
 //! guest-to-host log — see `push_rx_byte`.
+//!
+//! **Multi-UART**: `Serial` is parameterized by its own `base` I/O port
+//! (not hardcoded to COM1's) and an output `Sink`, so the identical,
+//! already-verified register logic backs COM1 (the interactive console,
+//! `Sink::Stdout`) and up to three additional real ISA-convention ports —
+//! COM2/COM3/COM4 (`--uart2-log`/`--uart3-log`/`--uart4-log`), each
+//! capturing its guest-transmitted bytes to a host file (`Sink::File`).
+//! Real BMCs commonly multiplex several serial channels this way (host
+//! console pass-through, a debug UART, SOL) — see `machine.rs`'s
+//! `SharedState::extra_uarts`. **Output-only, deliberately**: no RX/
+//! interactivity for the extra ports (a debug-UART/SOL-capture log has
+//! no reason to accept keyboard input the way the interactive COM1
+//! console does), and their protocol state isn't part of a snapshot
+//! (same category as a Python device plugin's own state — simple and
+//! always safely reconstructible fresh, not worth the `SnapshotDeps`
+//! plumbing a truly stateful device would need).
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::LazyLock;
 
 use crate::tty;
@@ -15,6 +32,48 @@ pub const COM1_BASE: u16 = 0x3f8;
 pub const COM1_PORTS: std::ops::Range<u16> = COM1_BASE..COM1_BASE + 8;
 /// ISA IRQ for COM1, routed 1:1 to GSI 4 by KVM's default in-kernel PIC/IOAPIC.
 pub const COM1_IRQ: u32 = 4;
+
+/// Real ISA convention: COM2 and COM4 share IRQ 3, COM1 and COM3 share
+/// IRQ 4 — genuine period-correct BIOS behavior (Linux's 8250 driver
+/// requests each with `IRQF_SHARED` for exactly this reason), not a
+/// hyperbug-specific shortcut. `IrqRegistry::register` already dedupes a
+/// repeated GSI (used for virtio-blk's 8 disks/virtio-gpio's 4 banks
+/// sharing one GSI each), so registering COM3 on the same GSI COM1
+/// already owns needs no special handling here.
+pub const COM2_BASE: u16 = 0x2f8;
+pub const COM2_PORTS: std::ops::Range<u16> = COM2_BASE..COM2_BASE + 8;
+pub const COM2_IRQ: u32 = 3;
+pub const COM3_BASE: u16 = 0x3e8;
+pub const COM3_PORTS: std::ops::Range<u16> = COM3_BASE..COM3_BASE + 8;
+pub const COM3_IRQ: u32 = 4;
+pub const COM4_BASE: u16 = 0x2e8;
+pub const COM4_PORTS: std::ops::Range<u16> = COM4_BASE..COM4_BASE + 8;
+pub const COM4_IRQ: u32 = 3;
+
+/// Where a `Serial` instance's transmitted bytes actually go.
+pub enum Sink {
+    /// COM1's own real interactive-console path (raw stdout, no
+    /// buffering — see `tty::write_stdout`'s own doc comment for why).
+    Stdout,
+    /// An extra UART's captured output — plain `File::write_all` +
+    /// `flush` per write, so a tailing `--uart2-log` reader sees bytes
+    /// promptly rather than waiting on internal buffering.
+    File(std::fs::File),
+}
+
+impl Sink {
+    fn write(&mut self, data: &[u8]) {
+        match self {
+            Sink::Stdout => tty::write_stdout(data),
+            Sink::File(f) => {
+                // Best-effort: a full disk or a removed log file shouldn't
+                // crash the guest's own console I/O.
+                let _ = f.write_all(data);
+                let _ = f.flush();
+            }
+        }
+    }
+}
 
 const REG_RBR: u16 = 0; // receive buffer (read) / THR (write)
 const REG_IER: u16 = 1;
@@ -41,8 +100,9 @@ const MSR_CTS_DSR_DCD: u8 = 0xb0; // CTS|DSR|DCD asserted: line looks "connected
 /// environment lock on every call.
 static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("HYPERBUG_SERIAL_TRACE").is_some());
 
-#[derive(Default)]
 pub struct Serial {
+    base: u16,
+    sink: Sink,
     ier: u8,
     // Scratch register: driver UART-type autodetection round-trips a value
     // through it, so it must actually store what's written.
@@ -52,9 +112,26 @@ pub struct Serial {
     rx: VecDeque<u8>,
 }
 
+impl Default for Serial {
+    /// COM1's own configuration — every existing caller (`SharedState::
+    /// serial`, every test in this module) expects `Serial::new()` to
+    /// mean exactly this, unchanged from before `base`/`Sink` existed.
+    fn default() -> Self {
+        Self { base: COM1_BASE, sink: Sink::Stdout, ier: 0, scratch: 0, rx: VecDeque::new() }
+    }
+}
+
 impl Serial {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An extra UART (COM2/COM3/COM4) capturing its transmitted bytes to
+    /// a host file, opened here (truncated fresh each launch — a log,
+    /// not something meant to accumulate silently across runs).
+    pub fn new_capture(base: u16, log_path: &str) -> std::io::Result<Self> {
+        let file = std::fs::File::create(log_path)?;
+        Ok(Self { base, sink: Sink::File(file), ier: 0, scratch: 0, rx: VecDeque::new() })
     }
 
     /// Host stdin produced a byte for the guest. Returns true if IRQ4
@@ -74,13 +151,13 @@ impl Serial {
         // zero-length slice would otherwise be an out-of-bounds index on
         // the single hottest guest-facing path in the VMM.
         let Some(&byte) = data.first() else { return false };
-        let reg = port.wrapping_sub(COM1_BASE);
+        let reg = port.wrapping_sub(self.base);
         if *TRACE {
             eprintln!("[serial-trace] OUT reg={reg} data={byte:#x}");
         }
         match reg {
             REG_RBR => {
-                tty::write_stdout(data);
+                self.sink.write(data);
                 self.ier & IER_THRI != 0
             }
             REG_IER => {
@@ -106,7 +183,7 @@ impl Serial {
     #[inline]
     pub fn handle_in(&mut self, port: u16, data: &mut [u8]) {
         data.fill(0);
-        let reg = port.wrapping_sub(COM1_BASE);
+        let reg = port.wrapping_sub(self.base);
         let value = match reg {
             REG_RBR => self.rx.pop_front().unwrap_or(0),
             // Real 16550 priority: RX data-ready outranks THR-empty.
@@ -214,6 +291,32 @@ mod tests {
         let mut serial = Serial::new();
         assert!(!serial.handle_out(COM1_BASE + REG_IER, &[]));
         serial.handle_in(COM1_BASE + REG_LSR, &mut []);
+    }
+
+    /// A second `Serial` instance at a different `base` runs the
+    /// identical register logic independently of COM1's — the actual
+    /// point of parameterizing `base` at all.
+    #[test]
+    fn a_second_serial_instance_at_a_different_base_works_independently() {
+        let dir = std::env::temp_dir().join(format!("hyperbug-uart-unit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("com2.log");
+
+        let mut com1 = Serial::new();
+        let mut com2 = Serial::new_capture(COM2_BASE, log_path.to_str().unwrap()).unwrap();
+
+        assert!(com2.handle_out(COM2_BASE + REG_IER, &[IER_THRI]), "THRI-on-enable must fire for COM2 too");
+        com2.handle_out(COM2_BASE + REG_RBR, b"hi");
+
+        // COM1 must be completely unaffected by COM2's traffic.
+        let mut data = [0u8; 1];
+        com1.handle_in(COM1_BASE + REG_LSR, &mut data);
+        assert_eq!(data[0] & LSR_DR, 0, "COM1 has no queued RX of its own");
+
+        let captured = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(captured, "hi", "COM2's transmitted bytes must land in its own capture file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

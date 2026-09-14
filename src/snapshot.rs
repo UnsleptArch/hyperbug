@@ -59,6 +59,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
+use crate::config::Args;
 use kvm_bindings::{
     KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, Msrs, kvm_irqchip, kvm_lapic_state,
     kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
@@ -100,6 +101,50 @@ const MSR_INDICES: [u32; 9] = [
 fn msrs_to_get() -> Msrs {
     Msrs::from_entries(&MSR_INDICES.map(|index| kvm_msr_entry { index, ..Default::default() }))
         .expect("MSR_INDICES is far under KVM_MAX_MSR_ENTRIES")
+}
+
+/// Rejects an operation that needs to serialize live machine state as
+/// `CapturedState` (`fork.rs`'s `fork <path>`, `migrate.rs`'s
+/// `migrate <host:port>`) if this launch's configuration includes
+/// anything that has no representation there — the same scope limits
+/// file-based `--restore` states in its own `lib.rs::validate_restore`
+/// (single-vCPU only, no device plugin state), extended to also name the
+/// runtime-only restrictions (`--record`/`--replay`/`--gdb-stub`/
+/// `--trace-file`) that only apply to a *live* capture, not a file someone
+/// already made with `--restore` in mind. Shared by both callers so they
+/// can't quietly drift apart on what each considers capturable.
+/// `feature` names the caller (`"fork"` or `"migrate"`) in the resulting
+/// error message.
+pub fn validate_capturable(args: &Args, feature: &str) -> Result<(), String> {
+    if args.smp != 1 {
+        return Err(format!("{feature} only supports --smp 1 today"));
+    }
+    if !args.devices.is_empty()
+        || !args.pci_devices.is_empty()
+        || !args.sandboxed_devices.is_empty()
+        || !args.sandboxed_pci_devices.is_empty()
+        || !args.native_devices.is_empty()
+        || !args.native_pci_devices.is_empty()
+        || !args.wasm_devices.is_empty()
+        || !args.wasm_pci_devices.is_empty()
+        || !args.i2c_devices.is_empty()
+        || !args.gpio_devices.is_empty()
+        || args.vsock_uds.is_some()
+    {
+        return Err(format!(
+            "{feature} doesn't support device plugins yet (their internal state doesn't survive it safely)"
+        ));
+    }
+    if args.record.is_some() || args.replay.is_some() {
+        return Err(format!("{feature} doesn't support --record/--replay yet"));
+    }
+    if args.gdb_stub.is_some() {
+        return Err(format!("{feature} doesn't support --gdb-stub yet"));
+    }
+    if args.trace_file.is_some() {
+        return Err(format!("{feature} doesn't support --trace-file yet"));
+    }
+    Ok(())
 }
 
 /// Anything with internal protocol state worth surviving a save/restore
@@ -150,15 +195,38 @@ fn struct_as_bytes<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
+/// Reads exactly `n` bytes from `r`, or a clean error on early EOF —
+/// shared by `read_from` (a `File` or a live `TcpStream`, for migration)
+/// and its own small `read_u*`/`struct_from_reader` helpers below.
+/// Reading from a generic `Read` instead of a pre-loaded `&[u8]` (the
+/// pre-migration design) is what let `read_from` serve both a file and a
+/// live network connection unchanged — a `TcpStream` has no fixed length
+/// to read into a buffer up front the way a file does.
+fn read_exact_vec(r: &mut impl Read, n: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).map_err(|e| format!("snapshot stream ended early: {e}"))?;
+    Ok(buf)
+}
+fn read_u8(r: &mut impl Read) -> Result<u8, String> {
+    Ok(read_exact_vec(r, 1)?[0])
+}
+fn read_u32(r: &mut impl Read) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_exact_vec(r, 4)?.try_into().unwrap()))
+}
+fn read_u64(r: &mut impl Read) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(read_exact_vec(r, 8)?.try_into().unwrap()))
+}
+
 /// The inverse of `struct_as_bytes`: reconstructs a `T` from exactly
-/// `size_of::<T>()` bytes. See `struct_as_bytes` for the safety argument.
-fn struct_from_bytes<T>(buf: &mut &[u8]) -> Result<T, String> {
-    let bytes = take(buf, size_of::<T>())?;
+/// `size_of::<T>()` bytes read off `r`. See `struct_as_bytes` for the
+/// safety argument.
+fn struct_from_reader<T>(r: &mut impl Read) -> Result<T, String> {
+    let bytes = read_exact_vec(r, size_of::<T>())?;
     // SAFETY: `zeroed` is valid for `T` (all-zero integers/arrays are a
     // legitimate `kvm_regs`/`kvm_sregs`/`kvm_mp_state` value — KVM itself
     // treats a freshly-`KVM_CREATE_VCPU`'d state as meaningfully close to
     // this), and `bytes.len() == size_of::<T>()` was just guaranteed by
-    // `take`.
+    // `read_exact_vec`.
     unsafe {
         let mut v: T = std::mem::zeroed();
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&mut v as *mut T).cast::<u8>(), size_of::<T>());
@@ -166,13 +234,17 @@ fn struct_from_bytes<T>(buf: &mut &[u8]) -> Result<T, String> {
     }
 }
 
-/// Everything `load_from_file` hands back to `lib.rs` to apply — vCPU
-/// state and the raw memory dump are ready to use directly; the device
-/// blobs are handed to each device's own `restore_state` in the same
-/// order `save_to_file` wrote them (disks, then net if present, then
-/// rng, then serial, then PCI config space — see `save_to_file`).
-pub struct LoadedSnapshot {
-    pub mem_size: u64,
+/// Every piece of live machine state a fresh KVM VM needs applied to
+/// resume exactly where a running guest left off — **except guest memory
+/// itself**, which is handled differently by this struct's two callers:
+/// `save_to_file`/`load_from_file` copy it into/out of a file; `fork.rs`
+/// doesn't copy it at all, relying on a real `fork()`'s copy-on-write
+/// semantics to hand the child the identical mapping for free. Sharing
+/// this struct (rather than each caller capturing/applying these fields
+/// independently) is what lets `lib.rs`'s `restore_vcpu`/
+/// `restore_device_state` serve both the file-based restore path and the
+/// fork path unchanged.
+pub struct CapturedState {
     pub num_cpus: u8,
     pub regs: kvm_regs,
     pub sregs: kvm_sregs,
@@ -197,26 +269,26 @@ pub struct LoadedSnapshot {
     pub ioapic: kvm_irqchip,
     pub pit: kvm_pit_state2,
     pub lapic: kvm_lapic_state,
-    pub memory: Vec<u8>,
     pub serial_blob: Vec<u8>,
     pub pci_blob: Vec<u8>,
     pub virtio_blobs: Vec<Vec<u8>>,
 }
 
-/// Serializes the whole machine to `path`. Called from the control
-/// socket's `snapshot <path>` command (`control.rs`), on the vCPU's own
-/// thread — the same "only touched from the vCPU's own thread" rule the
-/// existing `regs`/`write_regs` commands already follow, since reading
-/// `vcpu`'s registers is only safe there.
-pub fn save_to_file(
-    path: &str,
+/// Reads every piece of `CapturedState` off a *live* vCPU/VM — the shared
+/// core of both `save_to_file` (which adds a memory dump and writes it
+/// all to a file) and `fork.rs` (which uses this directly, no file, no
+/// memory copy: the child inherits guest memory via `fork()`'s own
+/// copy-on-write semantics instead). Called on the vCPU's own thread —
+/// the same "only touched from the vCPU's own thread" rule the control
+/// socket's existing `regs`/`write_regs` commands already follow, since
+/// reading `vcpu`'s registers is only safe there.
+pub fn capture_live_state(
     vm: &VmFd,
-    mem: &Arc<Mutex<GuestMemory>>,
     vcpu: &VcpuFd,
     serial: &Serial,
     pci_bus: &PciBus,
     virtio: &[Arc<Mutex<dyn Snapshot>>],
-) -> Result<(), String> {
+) -> Result<CapturedState, String> {
     let regs = vcpu.get_regs().map_err(|e| format!("KVM_GET_REGS: {e}"))?;
     let sregs = vcpu.get_sregs().map_err(|e| format!("KVM_GET_SREGS: {e}"))?;
     let mp_state = vcpu.get_mp_state().map_err(|e| format!("KVM_GET_MP_STATE: {e}"))?;
@@ -235,28 +307,7 @@ pub fn save_to_file(
     vm.get_irqchip(&mut ioapic).map_err(|e| format!("KVM_GET_IRQCHIP (IOAPIC): {e}"))?;
     let pit = vm.get_pit2().map_err(|e| format!("KVM_GET_PIT2: {e}"))?;
 
-    let mem = mem.lock().unwrap();
-
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&(mem.size() as u64).to_le_bytes());
-    out.push(1); // num_cpus — always 1 today, see the module doc comment
-    out.extend_from_slice(struct_as_bytes(&regs));
-    out.extend_from_slice(struct_as_bytes(&sregs));
-    out.extend_from_slice(struct_as_bytes(&mp_state));
-    out.extend_from_slice(struct_as_bytes(&xsave));
-    out.extend_from_slice(struct_as_bytes(&xcrs));
-    out.extend_from_slice(struct_as_bytes(&vcpu_events));
-    out.extend_from_slice(&(msrs.as_slice().len() as u32).to_le_bytes());
-    for entry in msrs.as_slice() {
-        out.extend_from_slice(&entry.index.to_le_bytes());
-        out.extend_from_slice(&entry.data.to_le_bytes());
-    }
-    out.extend_from_slice(struct_as_bytes(&pic_master));
-    out.extend_from_slice(struct_as_bytes(&pic_slave));
-    out.extend_from_slice(struct_as_bytes(&ioapic));
-    out.extend_from_slice(struct_as_bytes(&pit));
-    out.extend_from_slice(struct_as_bytes(&lapic));
+    let msrs = msrs.as_slice().iter().map(|e| (e.index, e.data)).collect();
 
     let mut blobs = Vec::with_capacity(virtio.len() + 2);
     for dev in virtio {
@@ -264,84 +315,12 @@ pub fn save_to_file(
     }
     blobs.push(serial.save_state());
     blobs.push(pci_bus.save_state());
-
-    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-    for blob in &blobs {
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(blob);
-    }
-
-    // The raw memory dump comes last, and last-written: it's the biggest
-    // part of the file by far, and reading it back is a single bulk copy
-    // rather than something that needs framing at all.
-    let mem_start = out.len();
-    out.resize(mem_start + mem.size(), 0);
-    assert!(mem.read_checked(0, &mut out[mem_start..]), "guest memory's own size must contain itself");
-
-    std::fs::File::create(path)
-        .and_then(|mut f| f.write_all(&out))
-        .map_err(|e| format!("writing snapshot to {path}: {e}"))
-}
-
-/// Reads and validates a snapshot file's structure, without yet applying
-/// any of it — `lib.rs` decides how to use `LoadedSnapshot` against the
-/// *current* launch's `Args` (memory size must match, exactly one virtio
-/// device blob per device `machine.rs` is about to construct, etc.).
-pub fn load_from_file(path: &str) -> Result<LoadedSnapshot, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("opening snapshot {path}: {e}"))?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).map_err(|e| format!("reading snapshot {path}: {e}"))?;
-    let mut buf = data.as_slice();
-
-    let magic = take(&mut buf, MAGIC.len())?;
-    if magic != MAGIC {
-        return Err(format!("{path} is not a hyperbug snapshot (bad magic)"));
-    }
-    let mem_size = take_u64(&mut buf)?;
-    let num_cpus = take_u8(&mut buf)?;
-    let regs = struct_from_bytes(&mut buf)?;
-    let sregs = struct_from_bytes(&mut buf)?;
-    let mp_state = struct_from_bytes(&mut buf)?;
-    let xsave = struct_from_bytes(&mut buf)?;
-    let xcrs = struct_from_bytes(&mut buf)?;
-    let vcpu_events = struct_from_bytes(&mut buf)?;
-    let msr_count = take_u32(&mut buf)?;
-    let mut msrs = Vec::with_capacity(msr_count as usize);
-    for _ in 0..msr_count {
-        let index = take_u32(&mut buf)?;
-        let data = take_u64(&mut buf)?;
-        msrs.push((index, data));
-    }
-    let pic_master = struct_from_bytes(&mut buf)?;
-    let pic_slave = struct_from_bytes(&mut buf)?;
-    let ioapic = struct_from_bytes(&mut buf)?;
-    let pit = struct_from_bytes(&mut buf)?;
-    let lapic = struct_from_bytes(&mut buf)?;
-
-    let blob_count = take_u32(&mut buf)?;
-    let mut blobs = Vec::with_capacity(blob_count as usize);
-    for _ in 0..blob_count {
-        let len = take_u32(&mut buf)? as usize;
-        blobs.push(take(&mut buf, len)?.to_vec());
-    }
-    // The last two blobs written are always serial then PCI (see
-    // `save_to_file`); everything before them is the virtio device list,
-    // in construction order.
-    let pci_blob = blobs.pop().ok_or("snapshot has no PCI config-space blob")?;
-    let serial_blob = blobs.pop().ok_or("snapshot has no serial-state blob")?;
+    let pci_blob = blobs.pop().unwrap();
+    let serial_blob = blobs.pop().unwrap();
     let virtio_blobs = blobs;
 
-    if buf.len() as u64 != mem_size {
-        return Err(format!(
-            "snapshot's memory dump is {} bytes, but its own header says {mem_size} bytes",
-            buf.len()
-        ));
-    }
-    let memory = buf.to_vec();
-
-    Ok(LoadedSnapshot {
-        mem_size,
-        num_cpus,
+    Ok(CapturedState {
+        num_cpus: 1, // always 1 today, see the module doc comment
         regs,
         sregs,
         mp_state,
@@ -354,11 +333,161 @@ pub fn load_from_file(path: &str) -> Result<LoadedSnapshot, String> {
         ioapic,
         pit,
         lapic,
-        memory,
         serial_blob,
         pci_blob,
         virtio_blobs,
     })
+}
+
+/// Everything `load_from_file` hands back to `lib.rs` to apply.
+pub struct LoadedSnapshot {
+    pub mem_size: u64,
+    pub captured: CapturedState,
+    pub memory: Vec<u8>,
+}
+
+/// Writes the whole machine's serialized form to `w` — a `File` for
+/// `save_to_file`, or (for live migration) a `TcpStream` connected to a
+/// waiting destination process, with no format difference between the
+/// two: the byte layout is entirely self-delimiting (every variable-
+/// length section carries its own count/length, and the fixed header
+/// states the memory dump's exact size), so a destination reading from
+/// either a file or a live socket parses it identically via `read_from`.
+pub fn write_to(w: &mut impl Write, captured: &CapturedState, mem: &GuestMemory) -> Result<(), String> {
+    let mut header = Vec::new();
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&(mem.size() as u64).to_le_bytes());
+    header.push(captured.num_cpus);
+    header.extend_from_slice(struct_as_bytes(&captured.regs));
+    header.extend_from_slice(struct_as_bytes(&captured.sregs));
+    header.extend_from_slice(struct_as_bytes(&captured.mp_state));
+    header.extend_from_slice(struct_as_bytes(&captured.xsave));
+    header.extend_from_slice(struct_as_bytes(&captured.xcrs));
+    header.extend_from_slice(struct_as_bytes(&captured.vcpu_events));
+    header.extend_from_slice(&(captured.msrs.len() as u32).to_le_bytes());
+    for &(index, data) in &captured.msrs {
+        header.extend_from_slice(&index.to_le_bytes());
+        header.extend_from_slice(&data.to_le_bytes());
+    }
+    header.extend_from_slice(struct_as_bytes(&captured.pic_master));
+    header.extend_from_slice(struct_as_bytes(&captured.pic_slave));
+    header.extend_from_slice(struct_as_bytes(&captured.ioapic));
+    header.extend_from_slice(struct_as_bytes(&captured.pit));
+    header.extend_from_slice(struct_as_bytes(&captured.lapic));
+
+    let blobs: Vec<&Vec<u8>> =
+        captured.virtio_blobs.iter().chain([&captured.serial_blob, &captured.pci_blob]).collect();
+    header.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+    for blob in &blobs {
+        header.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        header.extend_from_slice(blob);
+    }
+    w.write_all(&header).map_err(|e| format!("writing snapshot header: {e}"))?;
+
+    // The raw memory dump is written last and streamed straight from the
+    // live mapping (`as_slice`) rather than copied into another buffer
+    // first — the biggest part of the transfer by far, so avoiding a
+    // second full-guest-RAM copy matters more here than it did when this
+    // only ever wrote to a file.
+    w.write_all(mem.as_slice()).map_err(|e| format!("writing snapshot memory: {e}"))
+}
+
+/// Serializes the whole machine to `path`. Called from the control
+/// socket's `snapshot <path>` command (`control.rs`), on the vCPU's own
+/// thread — see `capture_live_state`'s own doc comment for why.
+pub fn save_to_file(
+    path: &str,
+    vm: &VmFd,
+    mem: &Arc<Mutex<GuestMemory>>,
+    vcpu: &VcpuFd,
+    serial: &Serial,
+    pci_bus: &PciBus,
+    virtio: &[Arc<Mutex<dyn Snapshot>>],
+) -> Result<(), String> {
+    let captured = capture_live_state(vm, vcpu, serial, pci_bus, virtio)?;
+    let mem = mem.lock().unwrap();
+    let mut file = std::fs::File::create(path).map_err(|e| format!("creating snapshot {path}: {e}"))?;
+    write_to(&mut file, &captured, &mem).map_err(|e| format!("writing snapshot to {path}: {e}"))
+}
+
+/// Reads and validates a serialized machine's structure off `r`, without
+/// yet applying any of it — `lib.rs` decides how to use `LoadedSnapshot`
+/// against the *current* launch's `Args` (memory size must match, exactly
+/// one virtio device blob per device `machine.rs` is about to construct,
+/// etc.). Works identically for a `File` (`load_from_file`) or a live
+/// `TcpStream` (migration's destination side, `migrate.rs`) — nothing
+/// here needs to know the transport's total length up front, since every
+/// section is read exactly as many bytes as its own header/count says.
+pub fn read_from(r: &mut impl Read) -> Result<LoadedSnapshot, String> {
+    let magic = read_exact_vec(r, MAGIC.len())?;
+    if magic != MAGIC {
+        return Err("not a hyperbug snapshot (bad magic)".to_string());
+    }
+    let mem_size = read_u64(r)?;
+    let num_cpus = read_u8(r)?;
+    let regs = struct_from_reader(r)?;
+    let sregs = struct_from_reader(r)?;
+    let mp_state = struct_from_reader(r)?;
+    let xsave = struct_from_reader(r)?;
+    let xcrs = struct_from_reader(r)?;
+    let vcpu_events = struct_from_reader(r)?;
+    let msr_count = read_u32(r)?;
+    let mut msrs = Vec::with_capacity(msr_count as usize);
+    for _ in 0..msr_count {
+        let index = read_u32(r)?;
+        let data = read_u64(r)?;
+        msrs.push((index, data));
+    }
+    let pic_master = struct_from_reader(r)?;
+    let pic_slave = struct_from_reader(r)?;
+    let ioapic = struct_from_reader(r)?;
+    let pit = struct_from_reader(r)?;
+    let lapic = struct_from_reader(r)?;
+
+    let blob_count = read_u32(r)?;
+    let mut blobs = Vec::with_capacity(blob_count as usize);
+    for _ in 0..blob_count {
+        let len = read_u32(r)? as usize;
+        blobs.push(read_exact_vec(r, len)?);
+    }
+    // The last two blobs written are always serial then PCI (see
+    // `write_to`); everything before them is the virtio device list, in
+    // construction order.
+    let pci_blob = blobs.pop().ok_or("snapshot has no PCI config-space blob")?;
+    let serial_blob = blobs.pop().ok_or("snapshot has no serial-state blob")?;
+    let virtio_blobs = blobs;
+
+    let memory = read_exact_vec(r, mem_size as usize)?;
+
+    Ok(LoadedSnapshot {
+        mem_size,
+        captured: CapturedState {
+            num_cpus,
+            regs,
+            sregs,
+            mp_state,
+            xsave,
+            xcrs,
+            vcpu_events,
+            msrs,
+            pic_master,
+            pic_slave,
+            ioapic,
+            pit,
+            lapic,
+            serial_blob,
+            pci_blob,
+            virtio_blobs,
+        },
+        memory,
+    })
+}
+
+/// Reads and validates a snapshot file specifically — see `read_from` for
+/// the actual parsing, which is transport-agnostic.
+pub fn load_from_file(path: &str) -> Result<LoadedSnapshot, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("opening snapshot {path}: {e}"))?;
+    read_from(&mut file).map_err(|e| format!("reading snapshot {path}: {e}"))
 }
 
 #[cfg(test)]
@@ -416,12 +545,12 @@ mod tests {
 
         let loaded = load_from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.mem_size, 4096);
-        assert_eq!(loaded.num_cpus, 1);
+        assert_eq!(loaded.captured.num_cpus, 1);
         assert_eq!(&loaded.memory[..14], b"hello snapshot");
-        assert!(loaded.virtio_blobs.is_empty());
+        assert!(loaded.captured.virtio_blobs.is_empty());
 
         let mut restored_serial = Serial::new();
-        restored_serial.restore_state(&loaded.serial_blob).unwrap();
+        restored_serial.restore_state(&loaded.captured.serial_blob).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
     }

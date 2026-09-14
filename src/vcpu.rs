@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, kvm_msi};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 
+use crate::crashdump::{ExitHistory, ExitKind, ExitRecord};
 use crate::device::SharedDevice;
 use crate::error::{ExitSlot, GuestExit, HyperbugError, request_exit};
+use crate::gdbstub::GdbStub;
 use crate::irq::IrqRegistry;
 use crate::machine::SharedState;
 use crate::mem::GuestMemory;
+use crate::trace::{TraceWriter, json_string};
 use crate::{pci, serial, tty};
 
 /// The classic QEMU/Bochs debug-console port: a raw byte straight to the
@@ -39,6 +42,33 @@ pub struct VcpuEnv {
     pub shared: Arc<Mutex<SharedState>>,
     pub exit_slot: ExitSlot,
     pub irqs: Arc<IrqRegistry>,
+    /// Opt-in Chrome Trace Event Format export — `None` unless
+    /// `--trace-file` was given. See `trace.rs`.
+    pub trace: Option<Arc<Mutex<TraceWriter>>>,
+    /// Where a triple-fault crash dump is written (`--crash-dir`, default
+    /// the current directory) — see `crashdump.rs`.
+    pub crash_dir: Option<String>,
+    /// `--replay`: `None` unless requested. Polled once per vCPU-loop
+    /// iteration on the BSP (`poll_host`) to deliver recorded keyboard
+    /// events at their recorded branch-count position — see `record.rs`'s
+    /// `Replayer` for what this does and doesn't cover.
+    pub replayer: Option<Arc<Mutex<crate::record::Replayer>>>,
+    /// The already-open `/dev/kvm` handle — shared (not touched from
+    /// anywhere but `fork.rs`) so a `fork <path>` control-socket command
+    /// can call `.create_vm()` on it again for the forked child's own
+    /// independent VM, without reopening `/dev/kvm`. See `fork.rs`'s own
+    /// doc comment for why this specific fd (unlike a `VmFd`/`VcpuFd`) is
+    /// safe to keep using after a real `fork()`.
+    pub kvm: Arc<kvm_ioctls::Kvm>,
+    /// This launch's own `Args` — `fork.rs` needs it both to check
+    /// whether forking is even supported for this configuration
+    /// (`validate_forkable`) and to build the forked child's own `Args`
+    /// (same configuration, different `control_socket`).
+    pub fork_args: crate::config::Args,
+    /// The rendezvous `fork.rs` uses to pause the reactor thread at a
+    /// safe point before forking — see `reactor::ReactorPause`'s own doc
+    /// comment.
+    pub reactor_pause: crate::reactor::ReactorPause,
 }
 
 /// Runs one vCPU's exit loop until the shared exit signal has a result —
@@ -47,8 +77,16 @@ pub struct VcpuEnv {
 /// internal fallibility (KVM ioctls, an unhandled VM-exit reason) returns
 /// through this `Result` rather than panicking or calling
 /// `std::process::exit`.
-pub fn run(cpu_id: u8, mut vcpu: VcpuFd, is_bsp: bool, env: &VcpuEnv) -> Result<GuestExit, HyperbugError> {
-    let result = Runner { cpu_id, is_bsp, env }.run(&mut vcpu);
+/// `gdb`: only meaningful when `is_bsp` is true (see `gdbstub.rs`'s module
+/// doc comment for why it's BSP-only) — every AP call passes `None`.
+pub fn run(
+    cpu_id: u8,
+    mut vcpu: VcpuFd,
+    is_bsp: bool,
+    env: &VcpuEnv,
+    gdb: Option<GdbStub>,
+) -> Result<GuestExit, HyperbugError> {
+    let result = Runner { cpu_id, is_bsp, env }.run(&mut vcpu, gdb);
     request_exit(&env.exit_slot, result.clone());
     result
 }
@@ -67,7 +105,7 @@ enum Action {
 }
 
 impl Runner<'_> {
-    fn run(&self, vcpu: &mut VcpuFd) -> Result<GuestExit, HyperbugError> {
+    fn run(&self, vcpu: &mut VcpuFd, mut gdb: Option<GdbStub>) -> Result<GuestExit, HyperbugError> {
         // Whether the once-per-iteration host-side polling below has
         // anything to do at all, decided once instead of re-checked (under
         // the shared lock) on every single VM exit.
@@ -78,9 +116,13 @@ impl Runner<'_> {
                 !state.plugin_pci_devices.is_empty(),
             )
         };
-        let polls_host = self.is_bsp && (has_control || has_plugin_devices);
+        let polls_host = self.is_bsp && (has_control || has_plugin_devices || self.env.replayer.is_some());
         let mut pending_irqs = Vec::new();
         let mut plugin_devices = Vec::new();
+        // Always kept, regardless of `--trace-file` — see
+        // `crashdump.rs`'s own doc comment for why this is cheap enough
+        // to run unconditionally.
+        let mut history = ExitHistory::new();
 
         loop {
             // Someone else (another vCPU thread, or an ACPI device write
@@ -96,12 +138,34 @@ impl Runner<'_> {
                 continue;
             }
 
+            if let Some(g) = gdb.as_mut() {
+                if g.wants_kill() {
+                    return Ok(GuestExit::UserQuit);
+                }
+                if g.is_attached() && g.is_stopped() {
+                    g.serve_until_resume(vcpu, &self.env.guest_mem)
+                        .map_err(|e| HyperbugError::Io(format!("gdb stub: {e}")))?;
+                    continue; // re-check kill/exit-slot before ever calling vcpu.run()
+                }
+            }
+
             // `VcpuExit` borrows the vCPU's shared `kvm_run` page, so
             // nothing in this match may touch `vcpu` again; the match
             // yields a plain `Action` instead, which ends that borrow and
             // lets the triple-fault report below read registers.
             let action = match vcpu.run() {
-                Ok(exit) => self.handle_exit(exit)?,
+                Ok(exit) => {
+                    let record = classify_exit(&exit);
+                    history.push(record);
+                    if let (VcpuExit::Debug(arch), Some(g)) = (&exit, gdb.as_mut()) {
+                        if let Err(e) = g.handle_debug_exit(vcpu, arch, &self.env.guest_mem) {
+                            crate::log_warn!("gdb stub: handling debug exit: {e}");
+                        }
+                        Action::Continue
+                    } else {
+                        self.trace_exit(record, || self.handle_exit(exit))?
+                    }
+                }
                 // Expected and frequent: the periodic wakeup timer
                 // installed in `lib::run` interrupting a `KVM_RUN` that was
                 // blocked waiting for the next guest event (see
@@ -111,7 +175,7 @@ impl Runner<'_> {
                 Err(e) => return Err(e.into()),
             };
             if action == Action::TripleFault {
-                self.report_triple_fault(vcpu)?;
+                self.report_triple_fault(vcpu, &history)?;
                 return Ok(GuestExit::TripleFault);
             }
 
@@ -139,6 +203,26 @@ impl Runner<'_> {
         }
     }
 
+    /// Runs `f` (the real exit dispatch), and if `--trace-file` is active,
+    /// wraps it in a Chrome Trace Event Format duration event named after
+    /// `record`'s kind/address. A plain pass-through with no timing calls
+    /// at all when tracing is off — the common case.
+    fn trace_exit(
+        &self,
+        record: ExitRecord,
+        f: impl FnOnce() -> Result<Action, HyperbugError>,
+    ) -> Result<Action, HyperbugError> {
+        let Some(trace) = &self.env.trace else { return f() };
+        let start = trace.lock().unwrap().begin();
+        let result = f();
+        let mut t = trace.lock().unwrap();
+        let dur = t.begin().saturating_sub(start);
+        let name = exit_trace_name(record);
+        let args = format!("{{\"addr\":{}}}", json_string(&format!("{:#x}", record.addr)));
+        t.duration_event(self.cpu_id, &name, "vmexit", start, dur, &args);
+        result
+    }
+
     /// Handles one VM exit. Deliberately takes no `VcpuFd`: `exit` borrows
     /// the vCPU's `kvm_run` page for as long as it's alive, so anything
     /// that needs the vCPU itself (reading registers after a triple fault)
@@ -154,6 +238,24 @@ impl Runner<'_> {
             }
             VcpuExit::IoIn(port, data) if serial::COM1_PORTS.contains(&port) => {
                 self.env.shared.lock().unwrap().serial.handle_in(port, data);
+            }
+            VcpuExit::IoOut(port, data) if serial::COM2_PORTS.contains(&port) => {
+                self.handle_extra_uart_out(0, serial::COM2_IRQ, port, data);
+            }
+            VcpuExit::IoIn(port, data) if serial::COM2_PORTS.contains(&port) => {
+                self.handle_extra_uart_in(0, port, data);
+            }
+            VcpuExit::IoOut(port, data) if serial::COM3_PORTS.contains(&port) => {
+                self.handle_extra_uart_out(1, serial::COM3_IRQ, port, data);
+            }
+            VcpuExit::IoIn(port, data) if serial::COM3_PORTS.contains(&port) => {
+                self.handle_extra_uart_in(1, port, data);
+            }
+            VcpuExit::IoOut(port, data) if serial::COM4_PORTS.contains(&port) => {
+                self.handle_extra_uart_out(2, serial::COM4_IRQ, port, data);
+            }
+            VcpuExit::IoIn(port, data) if serial::COM4_PORTS.contains(&port) => {
+                self.handle_extra_uart_in(2, port, data);
             }
             VcpuExit::IoOut(DEBUG_CONSOLE_PORT, data) => tty::write_stdout(data),
             VcpuExit::IoOut(port, data) if pci::PciBus::owns_port(port) => {
@@ -226,6 +328,36 @@ impl Runner<'_> {
     /// as long, on every vCPU. The device's own `Arc<Mutex<..>>` — always
     /// held regardless — is what still makes concurrent access to *that*
     /// device safe.
+    /// Handles a write to one of the three optional extra UARTs
+    /// (`slot` 0/1/2 = COM2/COM3/COM4 in `SharedState::extra_uarts`). A
+    /// `None` slot (that port wasn't requested) is a silent no-op — the
+    /// generic `IoOut`/`IoIn` fallback never runs for these fixed ISA
+    /// ranges (the match arm in `handle_exit` already claimed them), so
+    /// this is what makes an unpopulated port behave like real
+    /// hardware's own floating-bus convention rather than doing nothing
+    /// at all in a way that looks different from "no device here".
+    fn handle_extra_uart_out(&self, slot: usize, irq: u32, port: u16, data: &[u8]) {
+        let wants_irq = {
+            let mut state = self.env.shared.lock().unwrap();
+            let Some(uart) = &mut state.extra_uarts[slot] else { return };
+            uart.handle_out(port, data)
+        };
+        if wants_irq {
+            self.env.irqs.pulse(irq);
+        }
+    }
+
+    /// As `handle_extra_uart_out`, for a read — an unpopulated port
+    /// leaves `data` as `0xff` (the floating-bus convention every other
+    /// unmapped I/O port in this codebase already uses).
+    fn handle_extra_uart_in(&self, slot: usize, port: u16, data: &mut [u8]) {
+        let mut state = self.env.shared.lock().unwrap();
+        match &mut state.extra_uarts[slot] {
+            Some(uart) => uart.handle_in(port, data),
+            None => data.fill(0xff),
+        }
+    }
+
     fn dispatch_write(&self, is_mmio: bool, addr: u64, data: &[u8]) -> Option<Option<u32>> {
         let (device, offset, irq) = self.find_device(is_mmio, addr)?;
         let wants_irq = device.lock().unwrap().write(offset, data);
@@ -250,7 +382,7 @@ impl Runner<'_> {
         bus.find_device(addr)
     }
 
-    fn report_triple_fault(&self, vcpu: &VcpuFd) -> Result<(), HyperbugError> {
+    fn report_triple_fault(&self, vcpu: &VcpuFd, history: &ExitHistory) -> Result<(), HyperbugError> {
         let r = vcpu.get_regs()?;
         let s = vcpu.get_sregs()?;
         eprintln!(
@@ -258,6 +390,7 @@ impl Runner<'_> {
              cr3={:#x} cr4={:#x} efer={:#x} cs.sel={:#x} cs.l={}",
             self.cpu_id, r.rip, r.rsp, s.cr0, s.cr3, s.cr4, s.efer, s.cs.selector, s.cs.l
         );
+        crate::crashdump::write_crash_dump(self.env.crash_dir.as_deref(), self.cpu_id, "TripleFault", &r, &s, history);
         Ok(())
     }
 
@@ -272,6 +405,29 @@ impl Runner<'_> {
         pending_irqs: &mut Vec<u32>,
         plugin_devices: &mut Vec<(SharedDevice, u32)>,
     ) {
+        // `--replay`: deliver the next recorded keyboard event once the
+        // live branch counter has reached its recorded position — see
+        // `record.rs`'s `Replayer::poll_keyboard`. Delivered the same way
+        // `reactor.rs`'s `push_rx` delivers real keystrokes (push into the
+        // serial RX queue, pulse COM1's IRQ if that makes the port newly
+        // readable), since from the guest's own point of view a replayed
+        // keystroke should look identical to a real one.
+        if let Some(replayer) = &self.env.replayer {
+            let bytes = replayer.lock().unwrap().poll_keyboard();
+            if let Some(bytes) = bytes {
+                let mut wants_irq = false;
+                {
+                    let mut state = self.env.shared.lock().unwrap();
+                    for &byte in &bytes {
+                        wants_irq |= state.serial.push_rx_byte(byte);
+                    }
+                }
+                if wants_irq {
+                    self.env.irqs.pulse(serial::COM1_IRQ);
+                }
+            }
+        }
+
         // A control connection can send a command at any time. Reports
         // vCPU 0's registers regardless of which vCPU is "interesting" at
         // the moment — a known limitation for a multi-vCPU guest.
@@ -279,10 +435,29 @@ impl Runner<'_> {
         // registers can only safely be read from that vCPU's own thread.
         if has_control {
             let mut state = self.env.shared.lock().unwrap();
-            let crate::machine::SharedState { control, serial, pci_bus, virtio_snapshots, .. } = &mut *state;
+            let crate::machine::SharedState { control, serial, pci_bus, virtio_snapshots, plugin_registry, .. } =
+                &mut *state;
             if let Some(control) = control {
                 let snap = crate::control::SnapshotDeps { serial, pci_bus, virtio: virtio_snapshots };
-                control.poll(&self.env.vm, &self.env.guest_mem, vcpu, snap);
+                let fork = crate::control::ForkDeps {
+                    kvm: &self.env.kvm,
+                    args: &self.env.fork_args,
+                    pause: &self.env.reactor_pause,
+                };
+                let migrate = crate::control::MigrateDeps {
+                    args: &self.env.fork_args,
+                    pause: &self.env.reactor_pause,
+                    exit_slot: &self.env.exit_slot,
+                };
+                let deps = crate::control::PollDeps {
+                    vm: &self.env.vm,
+                    mem: &self.env.guest_mem,
+                    snap,
+                    fork,
+                    migrate,
+                    plugins: plugin_registry,
+                };
+                control.poll(vcpu, deps);
             }
         }
 
@@ -357,6 +532,37 @@ impl Runner<'_> {
             }
             return;
         }
+        if let Some(trace) = &self.env.trace {
+            trace.lock().unwrap().instant_event(self.cpu_id, &format!("irq{irq}"), "interrupt", "{}");
+        }
         self.env.irqs.pulse(irq);
+    }
+}
+
+/// A cheap, allocation-free summary of `exit`'s kind/address — computed
+/// while `exit` is still borrowed (no `VcpuFd` access needed, since these
+/// fields live in the `VcpuExit` value itself), for both the always-on
+/// crash-history ring buffer and, if active, the trace exporter's event
+/// name.
+fn classify_exit(exit: &VcpuExit<'_>) -> ExitRecord {
+    let (kind, addr) = match exit {
+        VcpuExit::IoOut(port, _) => (ExitKind::IoOut, u64::from(*port)),
+        VcpuExit::IoIn(port, _) => (ExitKind::IoIn, u64::from(*port)),
+        VcpuExit::MmioRead(addr, _) => (ExitKind::MmioRead, *addr),
+        VcpuExit::MmioWrite(addr, _) => (ExitKind::MmioWrite, *addr),
+        VcpuExit::Hlt => (ExitKind::Hlt, 0),
+        _ => (ExitKind::Other, 0),
+    };
+    ExitRecord { kind, addr }
+}
+
+fn exit_trace_name(record: ExitRecord) -> String {
+    match record.kind {
+        ExitKind::IoOut => format!("IoOut:{:#x}", record.addr),
+        ExitKind::IoIn => format!("IoIn:{:#x}", record.addr),
+        ExitKind::MmioRead => format!("MmioRead:{:#x}", record.addr),
+        ExitKind::MmioWrite => format!("MmioWrite:{:#x}", record.addr),
+        ExitKind::Hlt => "Hlt".to_string(),
+        ExitKind::Other => "Other".to_string(),
     }
 }

@@ -125,7 +125,7 @@ impl TapDevice {
             Ok(n) => Some(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
             Err(e) => {
-                eprintln!("[hyperbug] tap read error: {e}");
+                crate::log_warn!("tap read error: {e}");
                 None
             }
         }
@@ -133,7 +133,7 @@ impl TapDevice {
 
     pub fn write_frame(&mut self, frame: &[u8]) {
         if let Err(e) = self.file.write_all(frame) {
-            eprintln!("[hyperbug] tap write error: {e}");
+            crate::log_warn!("tap write error: {e}");
         }
     }
 }
@@ -176,6 +176,20 @@ impl VirtioNet {
 impl VirtioDeviceOps for VirtioNet {
     fn legacy_pci_device_id(&self) -> u16 {
         0x1000 // "Virtio network device", per /usr/share/hwdata/pci.ids
+    }
+
+    fn virtio_device_type(&self) -> u16 {
+        1 // VIRTIO_ID_NET, per <linux/virtio_ids.h>
+    }
+
+    /// RX is the one queue in this whole codebase where the guest posts
+    /// *empty* buffers for the device to fill *whenever it later has
+    /// data* — see `VirtioDeviceOps::wants_queue_notify`'s own doc
+    /// comment for the real bug this exists to prevent. TX keeps the
+    /// default (`true`): a TX kick genuinely means "here's a frame,
+    /// please send it now."
+    fn wants_queue_notify(&self, queue: u16) -> bool {
+        queue != RX_QUEUE
     }
 
     fn pci_class_code(&self) -> u32 {

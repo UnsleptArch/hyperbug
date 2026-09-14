@@ -101,13 +101,26 @@ fully trusted, and they solve *different* problems:
   drop — it solves availability/robustness fully, and closes off a
   specific, named set of privilege-escalation/boundary-crossing
   primitives, but is **not** full privilege containment.
+- **Resource limits (`mem=`/`cpu=` on `--device-sandboxed`/
+  `--pci-device-sandboxed`)** bound a specific plugin's memory and/or CPU
+  via a cgroups v2 ceiling/quota, joined by the child itself before
+  `exec` (`cgroup.rs`) — protects the **host** from a plugin that leaks
+  memory or busy-loops, rather than the guest or the VMM process
+  directly (those are already covered by the timeout/`SIGKILL` path
+  above). Explicitly **best-effort**: silently unenforced, with a
+  one-time warning, on a host without cgroups v2 or without delegated
+  permission to create one — a common case outside a systemd-managed or
+  rootful setup. Never assume a requested limit is actually active
+  without checking hyperbug's own stderr for that warning.
 
-**Combine both when a plugin is genuinely untrusted** (third-party code,
-something still being debugged): `--device-sandboxed ...:<dma_base>:
-<dma_size>` gets you "a hang or crash can't take anything else down," "a
-bad memory access can't reach guest RAM it has no business touching," and
-"a small set of privilege-escalation syscalls are denied outright." None
-of these are a substitute for actually reviewing third-party plugin code
+**Combine all applicable mitigations when a plugin is genuinely
+untrusted** (third-party code, something still being debugged):
+`--device-sandboxed ...:<dma_base>:<dma_size>:mem=<mb>:cpu=<pct>` gets
+you "a hang or crash can't take anything else down," "a bad memory
+access can't reach guest RAM it has no business touching," "a small set
+of privilege-escalation syscalls are denied outright," and "a runaway
+memory leak or busy-loop is capped, if cgroups v2 is available." None of
+these are a substitute for actually reviewing third-party plugin code
 before running it — the child still runs as the same user with the same
 filesystem/network access as the parent, with no namespace, capability
 drop, or UID change.
@@ -126,15 +139,73 @@ mode restrictions apply), and never expose it across a trust boundary
 (e.g. bind-mounting it into a less-trusted container, or a path writable
 by another user).
 
+### 5. A native (C ABI) plugin is fully trusted — by necessity, not choice
+
+`--native-device`/`--native-pci-device` (see
+[native-plugin-api.md](../native-plugin-api.md)) `dlopen()` a shared
+object directly into the `hyperbug` process. This is the **least
+contained** of every device-loading mechanism hyperbug has: no
+interpreter boundary (unlike in-process Python), no subprocess (unlike
+sandboxed Python), no seccomp filter, no cgroup, nothing. The loaded code
+runs with the full privileges of, and in the same address space as, the
+VMM itself — a bug in a native plugin can corrupt or crash the whole
+process, read or write arbitrary host memory, or do anything the
+`hyperbug` process itself could do. There is no sandboxed equivalent of
+this path, and none of `--device-sandboxed`'s mitigations (seccomp,
+cgroups, subprocess-crash isolation) apply to it. The only mitigation
+that *does* apply is DMA confinement — the same operator-declared
+`<dma_base>:<dma_size>` bound the Python ABI offers, unrelated to and no
+substitute for the process-level exposure above.
+
+Use this path only for code you completely trust and control — treat a
+`--native-device`/`--native-pci-device` argument with at least the same
+level of trust you'd give a `--pci-device` in-process Python plugin, and
+generally more: a memory-safety bug in native code has none of the
+(limited but real) containment a Python exception gives you.
+
+### 6. A WASM plugin is a fourth trust tier — genuine sandboxing, in-process, additive to the subprocess model
+
+`--wasm-device`/`--wasm-pci-device` (see
+[wasm-plugin-api.md](../wasm-plugin-api.md)) execute a WASM module
+in-process under `wasmtime`. This is deliberately **not** a replacement
+for sandboxed Python's subprocess isolation — it's a fourth option,
+picked for a plugin that doesn't need arbitrary Python but does need
+real throughput or wants isolation the native transport can't offer
+without a subprocess's IPC cost.
+
+Real, `wasmtime`-enforced properties: a module can only ever touch its
+own linear memory directly (no ability to read/write arbitrary
+`hyperbug` process memory, unlike the native transport); every access to
+guest-physical memory goes through a checked host callback
+(`host_read_mem`/`host_write_mem`/`host_raise_irq` — the module's only
+way out of its own sandbox); a real, enforced per-instance memory
+ceiling (`wasmtime::StoreLimits`, 64 MiB) that fails a `memory.grow`
+cleanly rather than consuming unbounded host memory; and type-checked
+exports (`get_typed_func` fails cleanly on a signature mismatch — no
+C-ABI-style "wrong signature is undefined behavior" risk the native
+transport has).
+
+What it does *not* give you: a separate OS process. Unlike sandboxed
+Python, a `wasmtime`-level bug (not the plugin module's own code) is
+still, in principle, a risk to the whole `hyperbug` process — no process
+boundary, no seccomp filter, no cgroup exists for this transport, because
+none of those apply to what's already a language-level sandbox rather
+than an OS-level one. Treat a WASM module the way you'd treat any
+sandboxed code: genuine isolation for its own logic, but not equivalent
+to a full subprocess boundary.
+
 ## Specific mechanisms, in more depth
 
 ### DMA confinement
 
-Enforced identically for the in-process (`pydevice.rs`'s `HyperbugCtx`)
-and sandboxed (`pydevice_proc.rs`'s callback handlers) loaders, via one
-shared check (`device::dma_range_allows`). A call outside the declared
-range raises the same `OSError` shape as an out-of-guest-RAM call, even
-for an address that is otherwise valid guest memory. See
+Enforced identically across all four transports — in-process
+(`pydevice.rs`'s `HyperbugCtx`), sandboxed (`pydevice_proc.rs`'s callback
+handlers), native (`native_plugin.rs`'s `host_read_mem`/`host_write_mem`),
+and WASM (`wasm_plugin.rs`'s imported `host_read_mem`/`host_write_mem`) —
+via one shared check (`device::dma_range_allows`). A call outside the
+declared range raises the same `OSError` shape (or, for native/WASM, the
+same `-1` return) as an out-of-guest-RAM call, even for an address that
+is otherwise valid guest memory. See
 [plugin-api.md](plugin-api.md#dma-confinement) for the exact syntax.
 
 Known scope limits, stated directly:
@@ -190,6 +261,25 @@ access, but both are correctness/reliability gaps worth knowing about
 before depending on snapshot/restore for anything you can't afford to
 lose.
 
+### Live migration scope
+
+`migrate <host:port>` (`migrate.rs`) streams the exact same serialized
+vCPU/device/memory state a snapshot file holds, over a plain TCP
+connection, to a separate hyperbug process launched with
+`--migrate-listen <host:port>`. **The stream itself has no encryption and
+no authentication of any kind** — anyone who can reach `host:port` over
+the network during the (typically brief) migration window can both read
+a complete copy of guest memory as it crosses the wire and, in principle,
+connect first and receive it themselves instead of the intended
+destination (`TcpListener::accept()` only ever accepts one connection,
+whichever arrives first). Treat the network path between source and
+destination the way you'd treat an unencrypted snapshot file: restrict it
+to a trusted network, or wrap it in your own tunnel (SSH, a private VPC)
+before relying on it across anything less trusted. This mirrors the
+snapshot file's own documented sensitivity above — migration is the same
+data, sent over a socket instead of written to disk, with no additional
+protection added.
+
 ### Network (`--net`)
 
 hyperbug creates its own TAP interface at runtime (needs `CAP_NET_ADMIN`
@@ -212,6 +302,20 @@ filtering of its own.
   the sandboxed-plugin subprocess has one) — it embeds a full CPython
   interpreter via PyO3 for in-process plugins, which makes a safe filter
   for that process a separate, larger piece of work.
+- No resource limits of any kind on an in-process (`--device`/
+  `--pci-device`) plugin — it shares the whole VMM process's own memory/
+  CPU budget by design. Sandboxed plugins can get a cgroup-enforced
+  ceiling (`mem=`/`cpu=`), but only best-effort, dependent on cgroups v2
+  being available and delegated to this process.
+- No isolation of any kind for a native (`--native-device`/
+  `--native-pci-device`) plugin — no interpreter boundary, no subprocess,
+  no seccomp, no cgroup. It runs with full process privileges by design;
+  DMA confinement is the only mitigation that applies to it.
+- No process boundary for a WASM (`--wasm-device`/`--wasm-pci-device`)
+  plugin — real `wasmtime`-enforced sandboxing of the module's own code
+  (linear-memory isolation, a memory ceiling, type-checked exports), but
+  no seccomp filter or cgroup, since neither concept applies to
+  language-level sandboxing the way it does to a subprocess.
 - No guest-facing IOMMU / DMA remapping for the built-in virtio devices.
 - No authentication, encryption, or access control on the control socket
   beyond OS filesystem permissions on its path.

@@ -14,29 +14,57 @@
 //! `error.rs` (how a run ends).
 
 mod acpi;
+mod cgroup;
 mod config;
 mod control;
 mod cpuid;
+mod crashdump;
 mod device;
 mod error;
+mod fork;
+mod gdbstub;
 mod gdt;
+mod gpio;
+mod i2c;
 mod irq;
 mod loader;
+mod logging;
 mod machine;
 mod mem;
+mod migrate;
+mod native_plugin;
 mod pci;
+mod plugin;
+/// `pub` (unlike every other internal module here) specifically so
+/// `tests/boot.rs` can attach a real `BranchCounter` to a live guest's
+/// vCPU thread from outside the process — the counter is meaningless
+/// without a genuine external target to point it at, so testing it can't
+/// stay purely internal the way the rest of this crate's unit tests do.
+pub mod pmu;
+/// `pub` for the same reason `pmu` is: `tests/boot.rs` needs to read a
+/// real recording file back to verify `--record` actually captured
+/// real, live keystrokes — there's no other way to inspect one from
+/// outside the process.
+pub mod record;
 mod pydevice;
 mod pydevice_proc;
 mod reactor;
 mod seccomp;
 mod serial;
+mod smbios;
 mod snapshot;
+mod trace;
 mod tty;
 mod vcpu;
 mod virtio;
 mod virtio_blk;
+mod virtio_gpio;
+mod virtio_i2c;
 mod virtio_net;
+mod virtio_vsock;
 mod virtio_rng;
+mod vsock;
+mod wasm_plugin;
 
 use std::sync::{Arc, Mutex};
 
@@ -77,10 +105,17 @@ const WAKEUP_INTERVAL_MS: i64 = 20;
 /// `std::process::exit` or panics on any of those paths — see the module
 /// doc comment for why that's the point.
 pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
-    let kvm = Kvm::new()?;
+    // `Arc`-wrapped so `fork.rs`'s forked child (a copy of this same
+    // process, sharing this value via `fork()`'s own COW semantics, not
+    // literal cross-process sharing) can call `.create_vm()` on it again
+    // to stand up its own independent VM — `/dev/kvm`'s own fd is a
+    // factory, not tied to any specific VM instance, so this is safe to
+    // reuse post-fork even though the VM/vCPU fds it creates are not.
+    let kvm = Arc::new(Kvm::new()?);
     let mem_size = validate_memory(&args)?;
     let num_cpus = validate_smp(&args, &kvm)?;
     validate_restore(&args)?;
+    validate_record(&args)?;
 
     let vm = Arc::new(kvm.create_vm()?);
     vm.create_irq_chip()?;
@@ -100,15 +135,21 @@ pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
         })
     }?;
 
-    // `--restore`: a snapshot supplies guest memory and vCPU state wholesale
-    // instead of a normal kernel boot (`validate_restore` already rejected
-    // anything this doesn't support — more than one vCPU, any Python device
-    // plugin). See `snapshot.rs`'s module doc comment for the full design.
-    let loaded_snapshot = match &args.restore {
-        Some(path) => Some(snapshot::load_from_file(path).map_err(HyperbugError::Config)?),
-        None => None,
+    // `--restore`/`--migrate-listen`: a snapshot supplies guest memory and
+    // vCPU state wholesale instead of a normal kernel boot
+    // (`validate_restore` already rejected anything this doesn't support
+    // — more than one vCPU, any Python device plugin, or both flags at
+    // once). See `snapshot.rs`'s module doc comment for the file-based
+    // design and `migrate.rs`'s for the live-network one; both produce
+    // the identical `LoadedSnapshot` shape from here on.
+    let loaded_snapshot = if let Some(path) = &args.restore {
+        Some(snapshot::load_from_file(path).map_err(HyperbugError::Config)?)
+    } else if let Some(addr) = &args.migrate_listen {
+        Some(migrate::receive_and_wait(addr).map_err(HyperbugError::Config)?)
+    } else {
+        None
     };
-    let vcpus = if let Some(snap) = &loaded_snapshot {
+    let (vcpus, captured_state) = if let Some(snap) = &loaded_snapshot {
         if snap.mem_size != mem_size {
             return Err(HyperbugError::Config(format!(
                 "snapshot was taken with {} MiB of guest memory, this launch has {} MiB \
@@ -122,12 +163,35 @@ pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
                 "snapshot's own memory dump doesn't fit the guest RAM it claims to describe".to_string(),
             ));
         }
-        restore_vcpu(&kvm, &vm, snap)?
+        (restore_vcpu(&kvm, &vm, &snap.captured)?, Some(&snap.captured))
     } else {
         let entry_point = load_guest(&args, &mut guest_mem, mem_size, num_cpus)?;
-        create_vcpus(&kvm, &vm, &mut guest_mem, mem_size, num_cpus, entry_point)?
+        (create_vcpus(&kvm, &vm, &mut guest_mem, mem_size, num_cpus, entry_point)?, None)
     };
 
+    run_from_vcpus(args, kvm, vm, guest_mem, vcpus, captured_state)
+}
+
+/// Everything from "guest memory becomes DMA-shared" onward — shared by
+/// the normal launch path above (`run`) and `fork.rs`'s forked child,
+/// which reaches this point with a *freshly created* VM/vCPU already
+/// carrying restored state (`restore_vcpu`, same as `--restore`'s own
+/// path) and *inherited* (copy-on-write, not copied) guest memory instead
+/// of a normal boot. Nothing below this point knows or cares which of
+/// those got it here — `args` is the only place that distinguishes them
+/// (a forked child's `Args` has `control_socket` overridden to its own
+/// new path, and `restore`/`record`/`replay`/`gdb_stub`/`trace_file`
+/// cleared — see `fork.rs`'s own doc comment for why each of those is
+/// disallowed for now).
+pub(crate) fn run_from_vcpus(
+    args: Args,
+    kvm: Arc<Kvm>,
+    vm: Arc<VmFd>,
+    guest_mem: GuestMemory,
+    vcpus: Vec<VcpuFd>,
+    captured_state: Option<&snapshot::CapturedState>,
+) -> Result<GuestExit, HyperbugError> {
+    let mem_size = guest_mem.size() as u64;
     // From here on, guest memory is also DMA-accessible to devices (virtio
     // and anything else that reads/writes guest RAM directly), so it's
     // shared rather than exclusively owned — and with more than one vCPU
@@ -138,9 +202,36 @@ pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
     // ACPI shutdown/reset devices record the run's outcome here.
     let exit_slot = new_exit_slot();
 
+    // `--record`: Milestone 2 of record-and-replay (`record.rs`) — tags
+    // every keyboard byte, delivered TAP packet, and virtio-rng byte
+    // returned to the guest with the host branch-count position it was
+    // produced/delivered at. Created before `Machine::build` so it can be
+    // handed to `VirtioRng` at construction time; `std::process::id()` is
+    // the BSP's own thread TID because `validate_record` already required
+    // `--smp 1`, and this function itself always runs on the process's
+    // main thread (the same one the BSP vCPU later runs on).
+    let recorder = match &args.record {
+        Some(path) => Some(Arc::new(
+            record::Recorder::start(path, std::process::id() as libc::pid_t, mem_size)
+                .map_err(HyperbugError::Config)?,
+        )),
+        None => None,
+    };
+    // `--replay`: Milestone 3 (`record.rs`'s `Replayer`) — re-delivers a
+    // previous `--record` run's keyboard/virtio-rng data. `validate_record`
+    // already rejected `--record` and `--replay` together, so at most one
+    // of `recorder`/`replayer` is ever `Some`.
+    let replayer = match &args.replay {
+        Some(path) => Some(Arc::new(Mutex::new(
+            record::Replayer::start(path, std::process::id() as libc::pid_t, mem_size)
+                .map_err(HyperbugError::Config)?,
+        ))),
+        None => None,
+    };
+
     let mut irqs = IrqRegistry::new();
-    let machine = Machine::build(&args, &vm, &guest_mem, &exit_slot, &mut irqs)?;
-    if let Some(snap) = &loaded_snapshot {
+    let machine = Machine::build(&args, &vm, &guest_mem, &exit_slot, &mut irqs, recorder.clone(), replayer.clone())?;
+    if let Some(snap) = captured_state {
         restore_device_state(&machine, snap)?;
     }
     let irqs = Arc::new(irqs);
@@ -151,22 +242,61 @@ pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
     // the guest's own tty layer) rather than output-only. A no-op (with a
     // clear reason) when stdin isn't actually a terminal — e.g. hyperbug's
     // own test harness or a piped script feeding it a kernel path only.
-    if !tty::enable_raw_stdin() {
+    // Skipped entirely under `--replay`: real typed input has no business
+    // mixing with recorded input being injected instead.
+    if replayer.is_none() && !tty::enable_raw_stdin() {
         eprintln!("[hyperbug] stdin isn't a terminal — guest console is output-only");
     }
 
     // Real, event-driven stdin/TAP handling: a dedicated thread blocking
     // in `epoll_wait`, injecting interrupts directly via `irqs` with no
     // vCPU thread involved at all — see `reactor.rs` for what deliberately
-    // stays on the per-iteration poll in `vcpu.rs`, and why.
-    reactor::spawn(
-        machine.shared.clone(),
-        exit_slot.clone(),
-        irqs.clone(),
-        machine.net_devices,
-        machine.virtio_notifies,
-        machine.blk_devices,
-    );
+    // stays on the per-iteration poll in `vcpu.rs`, and why. Real stdin is
+    // never watched under `--replay` (keyboard input comes from the
+    // recording instead, delivered from `vcpu.rs`'s own poll loop — see
+    // `VcpuEnv::replayer`); TAP still is, since network replay isn't
+    // implemented yet and a `--net` guest's other traffic should keep
+    // working normally.
+    // `fork.rs`'s rendezvous for pausing this reactor thread at a safe
+    // point before a `fork <path>` control-socket command forks the
+    // process — see `ReactorPause`'s own doc comment.
+    let reactor_pause = reactor::ReactorPause::new();
+    reactor::spawn(reactor::ReactorConfig {
+        shared: machine.shared.clone(),
+        exit_slot: exit_slot.clone(),
+        irqs: irqs.clone(),
+        net_devices: machine.net_devices,
+        virtio_notifies: machine.virtio_notifies,
+        blk_devices: machine.blk_devices,
+        gpio_devices: machine.gpio_devices,
+        vsock_device: machine.vsock_device,
+        recorder,
+        suppress_stdin: replayer.is_some(),
+        pause: reactor_pause.clone(),
+    });
+
+    // Opt-in Chrome Trace Event Format export — see `trace.rs`. `None`
+    // unless `--trace-file` was given, in which case every vCPU thread
+    // shares one writer (opt-in, so the extra lock per VM exit is an
+    // accepted cost, not a hot-path regression on a normal run).
+    let trace = match &args.trace_file {
+        Some(path) => Some(Arc::new(Mutex::new(trace::TraceWriter::create(path).map_err(|e| {
+            HyperbugError::Io(format!("creating trace file {path}: {e}"))
+        })?))),
+        None => None,
+    };
+
+    // `--gdb-stub`: blocks here (before any vCPU runs) until a debugger
+    // connects — see `gdbstub.rs` for the full scope (BSP-only, software
+    // breakpoints). `None` when not requested, in which case the BSP's
+    // loop never even checks for one.
+    let gdb = match &args.gdb_stub {
+        Some(addr) => Some(
+            gdbstub::GdbStub::listen(addr)
+                .map_err(|e| HyperbugError::Io(format!("gdb stub: binding {addr}: {e}")))?,
+        ),
+        None => None,
+    };
 
     let env = VcpuEnv {
         vm,
@@ -174,8 +304,14 @@ pub fn run(args: Args) -> Result<GuestExit, HyperbugError> {
         shared: machine.shared,
         exit_slot: exit_slot.clone(),
         irqs,
+        trace,
+        crash_dir: args.crash_dir.clone(),
+        replayer,
+        kvm,
+        fork_args: args,
+        reactor_pause,
     };
-    let bsp_result = spawn_vcpu_threads(vcpus, &env);
+    let bsp_result = spawn_vcpu_threads(vcpus, &env, gdb);
     exit_slot.take().unwrap_or(bsp_result)
 }
 
@@ -218,25 +354,57 @@ fn validate_smp(args: &Args, kvm: &Kvm) -> Result<u8, HyperbugError> {
 /// `--restore`'s scope limits (see `snapshot.rs`'s module doc comment):
 /// single vCPU only, and no Python device plugin (arbitrary, unserialized
 /// state).
+/// `--record`'s scope limit: single vCPU only, for the same reason
+/// `--restore` is — the branch-count position `record.rs` tags every
+/// event with is meaningless once more than one vCPU can be racing
+/// against it.
+fn validate_record(args: &Args) -> Result<(), HyperbugError> {
+    if args.record.is_some() && args.smp != 1 {
+        return Err(HyperbugError::Config("--record only supports --smp 1 today".to_string()));
+    }
+    if args.replay.is_some() && args.smp != 1 {
+        return Err(HyperbugError::Config("--replay only supports --smp 1 today".to_string()));
+    }
+    if args.record.is_some() && args.replay.is_some() {
+        return Err(HyperbugError::Config("--record and --replay are mutually exclusive".to_string()));
+    }
+    Ok(())
+}
+
+/// Shared by `--restore` and `--migrate-listen` — both feed a
+/// `snapshot::LoadedSnapshot` into the exact same restore path below, so
+/// they carry the exact same launch-time restrictions (single-vCPU, no
+/// Python device plugin state) and can't sensibly be combined with each
+/// other. Deliberately narrower than `snapshot::validate_capturable` (used
+/// on the *sending* side, `fork.rs`/`migrate.rs`): a file made by
+/// `--record`/`--replay`/`--gdb-stub`/`--trace-file`-adjacent code paths
+/// was never possible in the first place (those flags don't touch
+/// `CapturedState`), so there's nothing here to reject that isn't already
+/// covered by the device-plugin/`--smp` checks.
 fn validate_restore(args: &Args) -> Result<(), HyperbugError> {
-    if args.restore.is_none() {
+    if args.restore.is_some() && args.migrate_listen.is_some() {
+        return Err(HyperbugError::Config(
+            "--restore and --migrate-listen are mutually exclusive".to_string(),
+        ));
+    }
+    if args.restore.is_none() && args.migrate_listen.is_none() {
         return Ok(());
     }
+    let flag = if args.restore.is_some() { "--restore" } else { "--migrate-listen" };
     if args.smp != 1 {
-        return Err(HyperbugError::Config(
-            "--restore only supports --smp 1 today".to_string(),
-        ));
+        return Err(HyperbugError::Config(format!("{flag} only supports --smp 1 today")));
     }
     if !args.devices.is_empty()
         || !args.pci_devices.is_empty()
         || !args.sandboxed_devices.is_empty()
         || !args.sandboxed_pci_devices.is_empty()
+        || !args.i2c_devices.is_empty()
+        || !args.gpio_devices.is_empty()
+        || args.vsock_uds.is_some()
     {
-        return Err(HyperbugError::Config(
-            "--restore doesn't support Python device plugins yet — their state isn't part \
-             of a snapshot"
-                .to_string(),
-        ));
+        return Err(HyperbugError::Config(format!(
+            "{flag} doesn't support Python device plugins yet — their state isn't part of a snapshot"
+        )));
     }
     Ok(())
 }
@@ -246,7 +414,7 @@ fn validate_restore(args: &Args) -> Result<(), HyperbugError> {
 /// path — which would (harmlessly for a fresh boot, but not here) write a
 /// brand new GDT and page tables over guest memory that was *just*
 /// restored to its exact pre-snapshot bytes.
-fn restore_vcpu(kvm: &Kvm, vm: &VmFd, snap: &snapshot::LoadedSnapshot) -> Result<Vec<VcpuFd>, HyperbugError> {
+pub(crate) fn restore_vcpu(kvm: &Kvm, vm: &VmFd, snap: &snapshot::CapturedState) -> Result<Vec<VcpuFd>, HyperbugError> {
     // KVM's own in-kernel PIC/IOAPIC/PIT state, restored *before* the
     // vCPU itself resumes — see `snapshot.rs`'s module doc comment for
     // the real bug this closes: a fresh VM's fresh PIC has never had its
@@ -294,7 +462,7 @@ fn restore_vcpu(kvm: &Kvm, vm: &VmFd, snap: &snapshot::LoadedSnapshot) -> Result
 /// `snapshot.rs`'s module doc comment for why config-space BAR mappings
 /// need explicit restoring here rather than being replayed via guest PCI
 /// enumeration (restoring skips boot entirely, so nothing ever re-runs it).
-fn restore_device_state(machine: &Machine, snap: &snapshot::LoadedSnapshot) -> Result<(), HyperbugError> {
+fn restore_device_state(machine: &Machine, snap: &snapshot::CapturedState) -> Result<(), HyperbugError> {
     let mut shared = machine.shared.lock().unwrap();
     let SharedState { serial, pci_bus, mmio_bus, io_bus, virtio_snapshots, .. } = &mut *shared;
     serial.restore_state(&snap.serial_blob).map_err(HyperbugError::Config)?;
@@ -338,6 +506,7 @@ fn load_guest(
         .map_err(|e| HyperbugError::Config(e.to_string()))?;
     kernel.build_zero_page(guest_mem, mem_size, initramfs);
     acpi::setup_acpi(guest_mem, num_cpus)?;
+    smbios::setup_smbios(guest_mem)?;
     Ok(loaded.entry_point)
 }
 
@@ -438,11 +607,15 @@ fn setup_bsp(
 /// stated limitation, whose proper fix needs a real per-vCPU kick
 /// mechanism that was attempted and reverted after it caused a worse
 /// regression (see `docs/architecture.md`'s History section).
-fn spawn_vcpu_threads(mut vcpus: Vec<VcpuFd>, env: &VcpuEnv) -> Result<GuestExit, HyperbugError> {
+fn spawn_vcpu_threads(
+    mut vcpus: Vec<VcpuFd>,
+    env: &VcpuEnv,
+    gdb: Option<gdbstub::GdbStub>,
+) -> Result<GuestExit, HyperbugError> {
     for (index, ap) in vcpus.drain(1..).enumerate() {
         let cpu_id = index as u8 + 1;
         let env = env.clone();
-        std::thread::spawn(move || vcpu::run(cpu_id, ap, false, &env));
+        std::thread::spawn(move || vcpu::run(cpu_id, ap, false, &env, None));
     }
-    vcpu::run(0, vcpus.remove(0), true, env)
+    vcpu::run(0, vcpus.remove(0), true, env, gdb)
 }

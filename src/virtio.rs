@@ -314,6 +314,40 @@ pub trait VirtioDeviceOps: Send {
     /// device-type id being 5); verified against `/usr/share/hwdata/pci.ids`
     /// rather than assumed.
     fn legacy_pci_device_id(&self) -> u16;
+    /// The real virtio device-type id (net=1, block=2, rng=4, ... per
+    /// `virtio_ids.h` — verified against this host's own kernel header,
+    /// not assumed), served as the PCI Subsystem ID
+    /// (`PciDevice::subsystem_device_id`) `VirtioLegacyPci` reports.
+    /// **This is what a real legacy virtio driver actually matches
+    /// against** (`virtio_pci_legacy_dev.c` reads `vdev.id.device`
+    /// straight from the PCI Subsystem ID, not the PCI Device ID above) —
+    /// getting this wrong, or leaving it at 0, means no driver ever binds,
+    /// with no error visible anywhere short of the guest's own `/sys/bus/
+    /// virtio/devices` showing device id 0. Distinct from
+    /// `legacy_pci_device_id` on purpose: the two numbering schemes are
+    /// unrelated (see that method's own doc comment).
+    fn virtio_device_type(&self) -> u16;
+    /// Whether a guest "kick" (notify) of `queue` should actually drain and
+    /// process it synchronously. **`true` (the default) is correct for
+    /// every queue where the guest posts a buffer *containing the work to
+    /// do* (a TX frame, a block request, an RNG request) — the queue this
+    /// codebase was originally built around.** It is *not* correct for a
+    /// queue where the guest instead posts an *empty* buffer for the
+    /// device to fill *whenever it later has data* (virtio-net's RX
+    /// queue): draining that queue on kick pops the guest's freshly-posted
+    /// buffer and immediately marks it "used" with 0 bytes, before the
+    /// buffer ever gets a chance to receive a real incoming packet via
+    /// `try_deliver_rx` — starving RX delivery of buffers under exactly
+    /// the ordinary "guest posts, then kicks" sequence every real
+    /// virtio-net driver uses. A real, live-guest-verified bug found via
+    /// real `ping` traffic showing majority packet loss and an erratically
+    /// advancing avail-ring index — not something any existing unit test
+    /// (which never drives a real guest driver's RX-post-then-kick
+    /// sequence) could have caught. `VirtioNet` overrides this to exclude
+    /// `RX_QUEUE`; every other device's queues keep the default.
+    fn wants_queue_notify(&self, _queue: u16) -> bool {
+        true
+    }
     fn pci_class_code(&self) -> u32;
     fn num_queues(&self) -> u16;
     fn queue_size(&self, queue: u16) -> u16;
@@ -344,6 +378,25 @@ pub trait VirtioDeviceOps: Send {
     /// returns `Pending`.
     fn completion_eventfd(&self) -> Option<std::os::fd::RawFd> {
         None
+    }
+
+    /// Drains whatever variable-length buffers a device produced as a
+    /// *side effect* of `process_chain` handling some other queue's
+    /// request, each tagged with which queue it belongs on — for a
+    /// device (virtio-vsock's control-packet replies) whose reply to a
+    /// guest's request on one queue must be delivered as if the guest
+    /// had posted a receive buffer on a *different* queue, something
+    /// `process_chain` itself has no way to do (it only sees the one
+    /// chain it was handed). Checked by `VirtioModernPci` right after
+    /// every successful `drain_queue` call (both the synchronous
+    /// register-write path and the ioeventfd-driven one), delivering
+    /// each via `try_deliver_async`. Most devices never produce one and
+    /// use the default (nothing to deliver, ever) — distinct from
+    /// `poll_completions`/`ChainOutcome::Pending`, which is for
+    /// completing a chain the device *itself* already popped, not for
+    /// injecting one it never received.
+    fn take_outbox(&mut self) -> Vec<(u16, Vec<u8>)> {
+        Vec::new()
     }
 }
 
@@ -390,6 +443,14 @@ impl<D: VirtioDeviceOps> VirtioLegacyPci<D> {
     /// doesn't count here; its own completion, later, is what raises the
     /// IRQ for it (see `drain_completions`).
     fn drain_queue(&mut self, queue_idx: u16) -> bool {
+        // See `VirtioDeviceOps::wants_queue_notify`'s own doc comment: a
+        // "guest posts an empty buffer for the device to fill later"
+        // queue (virtio-net's RX) must never be drained just because the
+        // guest kicked it — that's the ordinary "I posted a fresh buffer"
+        // signal, not "please consume this now".
+        if !self.dev.wants_queue_notify(queue_idx) {
+            return false;
+        }
         let mut processed_any = false;
         loop {
             // Re-locked per chain rather than held across the whole drain:
@@ -554,6 +615,14 @@ impl<D: VirtioDeviceOps> PciDevice for VirtioLegacyPci<D> {
     fn device_id(&self) -> u16 {
         self.dev.legacy_pci_device_id()
     }
+    /// See `VirtioDeviceOps::virtio_device_type`'s own doc comment — this
+    /// is the field a real legacy virtio driver actually matches on.
+    fn subsystem_vendor_id(&self) -> u16 {
+        VIRTIO_VENDOR_ID
+    }
+    fn subsystem_device_id(&self) -> u16 {
+        self.dev.virtio_device_type()
+    }
     fn class_code(&self) -> u32 {
         self.dev.pci_class_code()
     }
@@ -574,7 +643,10 @@ impl<D: VirtioDeviceOps> PciDevice for VirtioLegacyPci<D> {
     /// one `EventFd` per queue and, once BAR0 gets a real address, KVM
     /// matches a 2-byte write of exactly this queue's index at
     /// `base + REG_QUEUE_NOTIFY` — never reaching this process as a VM
-    /// exit, let alone `Device::write`.
+    /// exit, let alone `Device::write`. A queue `wants_queue_notify`
+    /// refuses (virtio-net's RX) still gets a binding here — harmless,
+    /// since `drain_queue` itself no-ops for it — rather than complicating
+    /// this list with a filter for what's already a no-op downstream.
     fn ioevent_entries(&self) -> Vec<(u8, u64, u16)> {
         (0..self.dev.num_queues()).map(|q| (0u8, REG_QUEUE_NOTIFY, q)).collect()
     }
@@ -841,12 +913,102 @@ impl<D: VirtioDeviceOps> VirtioModernPci<D> {
         }
     }
 
+    /// Access to the device-specific state (e.g. virtio-gpio's wrapped
+    /// `GpioBank`) for code that needs to drive it from outside the
+    /// `Device` trait's guest-triggered read/write path — mirrors
+    /// `VirtioLegacyPci::device_mut`.
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.dev
+    }
+
+    /// As `VirtioLegacyPci::try_deliver_rx`, generalized to a flat byte
+    /// buffer instead of a header+frame split (virtio-vsock's own
+    /// packets are already one contiguous blob — see `vsock.rs`): pops
+    /// the next available buffer on `queue_idx` (if the guest has posted
+    /// one) and writes `data` into it, truncated to whatever room the
+    /// guest's own buffer actually has. Returns the IRQ to pulse if a
+    /// buffer was available, `None` if the guest hadn't posted one yet
+    /// (the caller is responsible for retrying later — virtio-vsock
+    /// simply drops it, matching a real NIC's own RX-buffer-exhaustion
+    /// behavior, see that module's own doc comment) or the queue isn't
+    /// configured.
+    pub fn try_deliver_async(&mut self, queue_idx: u16, data: &[u8]) -> Option<u32> {
+        let mut mem = self.mem.lock().unwrap();
+        let queue = self.queues.get_mut(usize::from(queue_idx))?;
+        if !queue.try_pop(&mem, &mut self.chain) {
+            return None;
+        }
+        let mut written = 0usize;
+        for buf in &self.chain.buffers {
+            if !buf.device_writable {
+                break;
+            }
+            let room = (buf.len as usize).min(data.len() - written);
+            if room == 0 {
+                break;
+            }
+            if !mem.write_checked(buf.addr, &data[written..written + room]) {
+                break;
+            }
+            written += room;
+            if written >= data.len() {
+                break;
+            }
+        }
+        self.queues[usize::from(queue_idx)].push_used(&mut mem, &self.chain, written as u32);
+        self.isr |= ISR_USED_BUFFER;
+        Some(u32::from(self.irq))
+    }
+
+    /// Drains `dev.take_outbox()` after a queue kick was just handled —
+    /// see that trait method's own doc comment for why this can't just
+    /// happen inside `process_chain` itself. Returns whether *any*
+    /// delivery succeeded, for the caller to fold into its own "should I
+    /// raise the IRQ" decision.
+    fn deliver_outbox(&mut self) -> bool {
+        let outbox = self.dev.take_outbox();
+        let mut delivered = false;
+        for (queue_idx, bytes) in outbox {
+            delivered |= self.try_deliver_async(queue_idx, &bytes).is_some();
+        }
+        delivered
+    }
+
+    /// As `VirtioLegacyPci::drain_completions` — finishes every request
+    /// the device's own async-completion mechanism has ready. Added here
+    /// (rather than only on the legacy transport, where it originated for
+    /// virtio-blk's io_uring backend) for virtio-gpio's event queue,
+    /// which needs the identical `ChainOutcome::Pending`/`poll_completions`
+    /// shape to defer a guest-armed interrupt buffer's completion until a
+    /// real event fires, potentially much later than the kick that armed
+    /// it.
+    pub fn drain_completions(&mut self) -> Option<u32> {
+        let completions = self.dev.poll_completions();
+        if completions.is_empty() {
+            return None;
+        }
+        let mut mem = self.mem.lock().unwrap();
+        for c in &completions {
+            mem.write_checked(c.status_buf_addr, &[c.status_byte]);
+            let Some(queue) = self.queues.get(usize::from(c.queue_idx)) else { continue };
+            queue.push_used_head(&mut mem, c.head_index, c.written_len + 1);
+        }
+        self.isr |= ISR_USED_BUFFER;
+        Some(u32::from(self.irq))
+    }
+
     /// Same draining logic as `VirtioLegacyPci::drain_queue` — kept as its
     /// own copy rather than shared, since the two transports' internal
     /// state (register file vs. common-cfg struct) differs enough that a
     /// shared helper would need its own indirection layer for no real
-    /// benefit at this codebase's size.
+    /// benefit at this codebase's size. See
+    /// `VirtioDeviceOps::wants_queue_notify`'s own doc comment for why the
+    /// check below is here — no device uses this transport for a
+    /// "guest-fills-later" queue today, but a future one might.
     fn drain_queue(&mut self, queue_idx: u16) -> bool {
+        if !self.dev.wants_queue_notify(queue_idx) {
+            return false;
+        }
         let mut processed_any = false;
         loop {
             let mut mem = self.mem.lock().unwrap();
@@ -1085,7 +1247,9 @@ impl<D: VirtioDeviceOps> Device for VirtioModernPci<D> {
             self.write_common_cfg(offset, data);
         } else if offset >= self.notify_base && offset < self.isr_base {
             let idx = ((offset - self.notify_base) / u64::from(NOTIFY_MULTIPLIER)) as u16;
-            if self.drain_queue(idx) {
+            let drained = self.drain_queue(idx);
+            let delivered = self.deliver_outbox();
+            if drained || delivered {
                 self.isr |= ISR_USED_BUFFER;
                 return true;
             }
@@ -1373,6 +1537,9 @@ mod modern_pci_tests {
         fn legacy_pci_device_id(&self) -> u16 {
             0 // unused by the modern transport
         }
+        fn virtio_device_type(&self) -> u16 {
+            0 // unused by the modern transport
+        }
         fn pci_class_code(&self) -> u32 {
             0xff_00_00
         }
@@ -1615,6 +1782,9 @@ mod modern_pci_tests {
             fn legacy_pci_device_id(&self) -> u16 {
                 0
             }
+            fn virtio_device_type(&self) -> u16 {
+                0
+            }
             fn pci_class_code(&self) -> u32 {
                 0
             }
@@ -1645,6 +1815,9 @@ mod legacy_snapshot_tests {
     struct DummyDev;
     impl VirtioDeviceOps for DummyDev {
         fn legacy_pci_device_id(&self) -> u16 {
+            0
+        }
+        fn virtio_device_type(&self) -> u16 {
             0
         }
         fn pci_class_code(&self) -> u32 {

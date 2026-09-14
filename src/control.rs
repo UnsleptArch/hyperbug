@@ -35,6 +35,30 @@
 //!   protocol state. See `snapshot.rs`'s module doc comment for exactly
 //!   what's covered and what isn't (single vCPU, no Python device plugin
 //!   state).
+//! - `reset_device <mmio|pci> <base_addr|device_number>` -> `OK` or `ERR
+//!   <message>`. Calls the plugin's `reset()` method (if it defines one —
+//!   a no-op, still `OK`, otherwise), without touching its code —
+//!   see `plugin.rs`/`docs/plugin-api.md` for what a plugin's `reset()`
+//!   is for.
+//! - `reload_device <mmio|pci> <base_addr|device_number>` -> `OK` or `ERR
+//!   <message>`. Re-reads the plugin file from disk and swaps in a fresh
+//!   instance, in place — the actual mechanism behind iterative device
+//!   development without restarting the guest. See
+//!   `machine::reload_plugin` for the full contract, including why a PCI
+//!   plugin's reload is refused outright if its identity changed.
+//! - `fork <new-control-socket-path>` -> `OK <child_pid>` or `ERR
+//!   <message>`. Clones the *live* running guest into a brand new,
+//!   independent process — see `fork.rs`'s own module doc comment for the
+//!   full mechanism and its real scope limits (single vCPU, no device
+//!   plugins, no `--record`/`--replay`/`--gdb-stub`/`--trace-file`).
+//! - `migrate <dest-host:dest-port>` -> `OK` or `ERR <message>`. Live
+//!   migration: streams the running guest's whole state (vCPU + guest
+//!   memory + device state) over TCP to a separate hyperbug process
+//!   launched with `--migrate-listen <dest-host:dest-port>`, then retires
+//!   this process's own guest (`GuestExit::MigratedAway`) — see
+//!   `migrate.rs`'s own module doc comment for the full mechanism and its
+//!   scope limits (the same ones `fork` has, plus: no encryption/auth on
+//!   the stream, and stop-the-world rather than pre-copy).
 //! - anything else -> `ERR unknown command`
 //!
 //! Up to `MAX_CLIENTS` connections at once, each with its own line buffer
@@ -52,10 +76,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::kvm_regs;
-use kvm_ioctls::{VcpuFd, VmFd};
+use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 
+use crate::config::Args;
+use crate::device::Device;
+use crate::error::ExitSlot;
+use crate::machine::PluginRegistryEntry;
 use crate::mem::GuestMemory;
 use crate::pci::PciBus;
+use crate::reactor::ReactorPause;
 use crate::serial::Serial;
 use crate::snapshot::Snapshot;
 
@@ -99,7 +128,7 @@ impl Client {
                 Err(_) => return false,
             }
             if self.buf.len() > MAX_LINE {
-                eprintln!("[hyperbug] control client sent an over-long line; dropping it");
+                crate::log_warn!("control client sent an over-long line; dropping it");
                 return false;
             }
         }
@@ -151,11 +180,11 @@ impl ControlServer {
     /// Call once per vCPU-loop iteration. Accepts any new clients, reads
     /// whatever each has available, and answers every complete
     /// (newline-terminated) command line found so far.
-    pub fn poll(&mut self, vm: &VmFd, mem: &Arc<Mutex<GuestMemory>>, vcpu: &mut VcpuFd, snap: SnapshotDeps) {
+    pub fn poll(&mut self, vcpu: &mut VcpuFd, deps: PollDeps) {
         self.accept();
         let mut i = 0;
         while i < self.clients.len() {
-            if self.serve_client(i, vm, mem, vcpu, snap) {
+            if self.serve_client(i, vcpu, deps) {
                 i += 1;
             } else {
                 self.clients.swap_remove(i);
@@ -172,9 +201,8 @@ impl ControlServer {
                         // a connection sitting in the listen backlog looks
                         // "connected" to its client and then hangs forever,
                         // whereas an immediate close is a clear answer.
-                        eprintln!(
-                            "[hyperbug] control socket: refusing connection, \
-                             {MAX_CLIENTS} clients already attached"
+                        crate::log_warn!(
+                            "control socket: refusing connection, {MAX_CLIENTS} clients already attached"
                         );
                         continue;
                     }
@@ -183,7 +211,7 @@ impl ControlServer {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    eprintln!("[hyperbug] control socket accept failed: {e}");
+                    crate::log_error!("control socket accept failed: {e}");
                     break;
                 }
             }
@@ -192,14 +220,7 @@ impl ControlServer {
 
     /// Serves every complete line one client has sent. Returns false when
     /// that client should be dropped.
-    fn serve_client(
-        &mut self,
-        idx: usize,
-        vm: &VmFd,
-        mem: &Arc<Mutex<GuestMemory>>,
-        vcpu: &mut VcpuFd,
-        snap: SnapshotDeps,
-    ) -> bool {
+    fn serve_client(&mut self, idx: usize, vcpu: &mut VcpuFd, deps: PollDeps) -> bool {
         if !self.clients[idx].fill() {
             return false;
         }
@@ -212,7 +233,7 @@ impl ControlServer {
             // same time without giving up the buffer reuse.
             let mut reply = std::mem::take(&mut self.reply);
             reply.clear();
-            handle_command(&line, vm, mem, vcpu, snap, &mut reply);
+            handle_command(&line, vcpu, deps, &mut reply);
             reply.push('\n');
             let alive = self.clients[idx].send(&reply);
             self.reply = reply;
@@ -245,14 +266,42 @@ pub struct SnapshotDeps<'a> {
     pub virtio: &'a [Arc<Mutex<dyn Snapshot>>],
 }
 
-fn handle_command(
-    line: &str,
-    vm: &VmFd,
-    mem: &Arc<Mutex<GuestMemory>>,
-    vcpu: &mut VcpuFd,
-    snap: SnapshotDeps,
-    out: &mut String,
-) {
+/// The extra context a `fork <path>` command needs beyond `SnapshotDeps`
+/// — see `fork.rs`'s own module doc comment. Plain `&'a` references, so
+/// trivially `Copy`, same as `SnapshotDeps`.
+#[derive(Clone, Copy)]
+pub struct ForkDeps<'a> {
+    pub kvm: &'a Arc<Kvm>,
+    pub args: &'a Args,
+    pub pause: &'a ReactorPause,
+}
+
+/// The extra context a `migrate <host:port>` command needs beyond
+/// `SnapshotDeps` — see `migrate.rs`'s own module doc comment. Plain `&'a`
+/// references, so trivially `Copy`, same as `ForkDeps`.
+#[derive(Clone, Copy)]
+pub struct MigrateDeps<'a> {
+    pub args: &'a Args,
+    pub pause: &'a ReactorPause,
+    pub exit_slot: &'a ExitSlot,
+}
+
+/// Everything `poll`/`serve_client`/`handle_command` need besides
+/// `self`/`vcpu` — bundled once `fork`'s own extra context pushed the
+/// plain parameter list past clippy's arity lint. Plain `&'a`
+/// references/`Copy` sub-structs throughout, so trivially `Copy` itself.
+#[derive(Clone, Copy)]
+pub struct PollDeps<'a> {
+    pub vm: &'a VmFd,
+    pub mem: &'a Arc<Mutex<GuestMemory>>,
+    pub snap: SnapshotDeps<'a>,
+    pub fork: ForkDeps<'a>,
+    pub migrate: MigrateDeps<'a>,
+    pub plugins: &'a [PluginRegistryEntry],
+}
+
+fn handle_command(line: &str, vcpu: &mut VcpuFd, deps: PollDeps, out: &mut String) {
+    let PollDeps { vm, mem, snap, fork, migrate, plugins } = deps;
     let mut parts = line.split_whitespace();
     match parts.next() {
         Some("read_mem") => {
@@ -348,8 +397,101 @@ fn handle_command(
                 }
             }
         }
+        Some("fork") => {
+            let Some(new_control_socket) = parts.next() else {
+                out.push_str("ERR usage: fork <new-control-socket-path>");
+                return;
+            };
+            let req = crate::fork::ForkRequest { kvm: fork.kvm, old_vm: vm, mem, args: fork.args, pause: fork.pause, snap };
+            match crate::fork::handle_fork(new_control_socket, vcpu, req) {
+                Ok(child_pid) => {
+                    let _ = write!(out, "OK {child_pid}");
+                }
+                Err(msg) => {
+                    let _ = write!(out, "ERR {msg}");
+                }
+            }
+        }
+        Some("migrate") => {
+            let Some(dest_addr) = parts.next() else {
+                out.push_str("ERR usage: migrate <dest-host:dest-port>");
+                return;
+            };
+            let req = crate::migrate::MigrateRequest {
+                vm,
+                mem,
+                args: migrate.args,
+                pause: migrate.pause,
+                exit_slot: migrate.exit_slot,
+                snap,
+            };
+            match crate::migrate::handle_migrate(dest_addr, vcpu, req) {
+                Ok(()) => out.push_str("OK"),
+                Err(msg) => {
+                    let _ = write!(out, "ERR {msg}");
+                }
+            }
+        }
+        Some("reset_device") => {
+            let (Some(kind), Some(value)) = (parts.next(), parts.next()) else {
+                out.push_str("ERR usage: reset_device <mmio|pci> <base_addr|device_number>");
+                return;
+            };
+            match find_plugin(plugins, kind, value) {
+                Ok(entry) => {
+                    entry.device.lock().unwrap().reset();
+                    out.push_str("OK");
+                }
+                Err(msg) => {
+                    let _ = write!(out, "ERR {msg}");
+                }
+            }
+        }
+        Some("reload_device") => {
+            let (Some(kind), Some(value)) = (parts.next(), parts.next()) else {
+                out.push_str("ERR usage: reload_device <mmio|pci> <base_addr|device_number>");
+                return;
+            };
+            match find_plugin(plugins, kind, value) {
+                Ok(entry) => match crate::machine::reload_plugin(entry, mem) {
+                    Ok(()) => out.push_str("OK"),
+                    Err(msg) => {
+                        let _ = write!(out, "ERR {msg}");
+                    }
+                },
+                Err(msg) => {
+                    let _ = write!(out, "ERR {msg}");
+                }
+            }
+        }
         _ => out.push_str("ERR unknown command"),
     }
+}
+
+/// Finds the plugin `reset_device`/`reload_device` named — `kind` is
+/// `"mmio"` (selector: base address, hex) or `"pci"` (selector: PCI
+/// device number, decimal, matching what the operator passed to
+/// `--pci-device`/`--pci-device-sandboxed`, not the internal devfn).
+fn find_plugin<'a>(
+    plugins: &'a [PluginRegistryEntry],
+    kind: &str,
+    value: &str,
+) -> Result<&'a PluginRegistryEntry, String> {
+    let selector = match kind {
+        "mmio" => {
+            let addr = parse_addr(value).ok_or_else(|| format!("bad mmio address {value:?}"))?;
+            crate::machine::PluginSelector::Mmio(addr)
+        }
+        "pci" => {
+            let devnum: u8 = value.parse().map_err(|e| format!("bad pci device number {value:?}: {e}"))?;
+            crate::machine::PluginSelector::Pci(devnum)
+        }
+        other => return Err(format!("unknown selector kind {other:?} (expected mmio or pci)")),
+    };
+    plugins
+        .iter()
+        .find(|e| e.selector == selector)
+        .ok_or_else(|| format!("no matching plugin device ({kind} {value})"))
 }
 
 /// Applies `field=hex` assignments onto a register snapshot. Split out

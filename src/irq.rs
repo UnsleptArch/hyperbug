@@ -72,7 +72,7 @@ impl IrqRegistry {
     pub fn pulse(&self, gsi: u32) {
         match self.lines.get(&gsi) {
             Some(line) => line.pulse(),
-            None => eprintln!("[hyperbug] BUG: no irqfd registered for IRQ {gsi}"),
+            None => crate::log_error!("BUG: no irqfd registered for IRQ {gsi}"),
         }
     }
 }

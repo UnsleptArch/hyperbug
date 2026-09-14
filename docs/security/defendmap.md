@@ -112,20 +112,43 @@ running in its own subprocess (`--device-sandboxed`/
 `--pci-device-sandboxed`), from the parent hyperbug process's point of
 view — the child is explicitly not fully trusted, that's the entire
 reason the subprocess boundary exists.
-**Reachable code**: `pydevice_proc.rs`'s reply parser (parent side) and
-`python/hyperbug/_sandbox_runner.py`'s command parser (child side).
+**Reachable code**: `pydevice_proc.rs`'s `wire::read_frame` (parent side)
+and `python/hyperbug/_sandbox_runner.py`'s `_read_frame`/`_dispatch`
+(child side). Since a prior pass, the wire format itself changed from
+hex-encoded text to a binary length-prefixed frame (`<u32 length><type
+byte><payload>`) — adopted for payload-volume reasons (hex encoding and
+per-byte-pair parsing cost double for a device with real bulk data), not
+security ones, but worth noting the parser this entry describes is a
+different, smaller one than before.
 
 - **A hung or crashed plugin** — DEFENDED. A 200ms reply timeout or a
   dead pipe results in an unconditional `SIGKILL` of the child and the
   device faulting to a clean no-op; verified directly with a plugin whose
   `write()` sleeps 60 seconds.
-- **A malformed reply from the child (bad hex, wrong field count, an
-  unexpected command)** — PARTIAL. The line-based text protocol is
-  simple enough to review by reading it directly, and basic malformed
-  input has hand-written coverage (hex round-trips, bad-input rejection
-  in the equivalent `control.rs` protocol this mirrors), but the
-  sandboxed-plugin protocol parser itself has no dedicated adversarial/
-  fuzz coverage yet — **HELD** for that specific gap.
+- **A malformed reply from the child (a truncated frame, an unexpected
+  message type, a length prefix past what's actually sent)** — PARTIAL.
+  `read_frame` treats a short/truncated read the same as EOF (the
+  device faults cleanly, same as a dead child), and an unrecognized
+  message type is handled explicitly (mapped to an error string) rather
+  than falling through to undefined behavior — but no dedicated
+  adversarial/fuzz coverage exists yet for this specific parser
+  (property-based coverage exists for PCI config space and virtqueue
+  chains — see items 1/2 — not yet extended here). **HELD** for that
+  specific gap.
+- **A malicious child claiming a huge frame length to force a large
+  host-side allocation** — DEFENDED. Found and fixed in the same pass
+  that introduced the binary framing: `read_frame` now refuses any length
+  above a 64 MiB ceiling (`MAX_FRAME_LEN`) before allocating a buffer for
+  it, treating an oversized claim the same as a dead pipe. A related,
+  narrower version of the same class of bug was also found and fixed in
+  `handle_read_mem`'s `CB_READ_MEM` handling specifically: a plugin's own
+  `self.hyperbug.read_mem(addr, size)` call carries its own `size` field
+  (up to `u32::MAX`) inside a tiny 12-byte request — unrelated to the
+  frame-length cap above — and the handler used to allocate a buffer
+  sized from it *before* checking whether `addr`/`size` even fit in
+  guest RAM. Fixed by checking bounds first. Both are covered by
+  dedicated tests confirming the rejection is fast (no multi-gigabyte
+  allocation actually attempted), not just checking the returned error.
 - **A plugin's DMA calls reaching guest memory outside an operator-
   declared confinement range** — DEFENDED (see `security.md`'s DMA
   confinement section) — enforced identically for in-process and
@@ -153,6 +176,21 @@ reason the subprocess boundary exists.
   in-process plugins, whose allocator/C-extension surface makes a safe
   syscall filter for that process a separate, larger piece of work than
   this one, deliberately not attempted alongside it.
+- **A plugin exhausting host memory or CPU (a leak, a busy-loop, an
+  intentional resource-exhaustion attempt)** — PARTIAL. `mem=`/`cpu=` on
+  `--device-sandboxed`/`--pci-device-sandboxed` apply a real cgroups v2
+  memory ceiling and/or CPU quota to that specific plugin's subprocess
+  (`cgroup.rs`), joined by the child itself before `exec` so there's no
+  window where it runs unconfined. Genuinely **best-effort**, not
+  DEFENDED outright: silently unenforced (with a one-time stderr
+  warning) if cgroups v2 isn't mounted or this process isn't delegated
+  permission to create a cgroup — verified as the actual, common
+  real-world case on this project's own dev host, which has cgroups v2
+  mounted but no delegated write access for a non-root user. Opt-in
+  (`None` by default, matching every plugin's behavior before this
+  existed) and only ever applies to the sandboxed subprocess — an
+  in-process plugin has no equivalent at all (see item 8's "no resource
+  limits on in-process plugins" framing in `security.md`).
 
 ## 5. Live control socket
 
@@ -235,7 +273,98 @@ a latent memory-safety error in code the type system can't check.
   ASAN/UBSAN or Miri run has actually been performed — most of these
   blocks call real syscalls Miri can't execute, but `snapshot.rs`'s two
   pure-memory-reinterpretation functions are a concrete, not-yet-taken
-  Miri target.
+  Miri target. `native_plugin.rs`'s own FFI `unsafe` blocks (raw
+  function-pointer calls, the `HostCtxData`/`CHostCtx` pointer plumbing)
+  were reviewed as they were written, following the same discipline, but
+  haven't yet been folded into a dedicated re-audit pass the way the
+  original 34 were — worth doing next time this item is revisited.
+
+## 9. Native (C ABI) plugin loading
+
+**Attacker**: whatever loaded the `.so` in the first place — this
+surface is unusual in that the "attack" is simply *using the feature at
+all*, not a malformed-input case the way items 1-7 are. There is no
+untrusted-input parsing to defend here; the whole mechanism is trust-by-
+design, not trust-by-verification.
+**Reachable code**: `native_plugin.rs`, `include/hyperbug_plugin.h`.
+
+- **Isolating a native plugin from the rest of the process** — HELD, by
+  explicit design, not oversight. A `--native-device`/
+  `--native-pci-device` plugin is `dlopen()`ed directly into `hyperbug`
+  and runs with full process privileges — no interpreter boundary, no
+  subprocess, no seccomp, no cgroup. See `security.md`'s trust-tier 5 for
+  the full statement. This will never become DEFENDED without a
+  fundamentally different loading mechanism (e.g. a real out-of-process
+  native plugin host, analogous to the sandboxed Python transport) —
+  it's listed here for completeness, not as a bug to fix.
+- **A plugin's DMA calls reaching guest memory outside an operator-
+  declared confinement range** — DEFENDED. Enforced by the same shared
+  `device::dma_range_allows` check the Python transports use, verified
+  directly (no cross-language-boundary gap): a native plugin's
+  `read_mem`/`write_mem` callbacks refuse an out-of-range or
+  out-of-confinement call with `-1`, the same as the Python ABI's
+  `OSError`.
+- **A malicious or buggy `.so` claiming ABI compatibility it doesn't
+  have** — DEFENDED for the version-mismatch case (checked once at load,
+  refused with a clear "too new"/"too old" message, mirroring the Python
+  ABI's range check) — but this is **not** a security boundary the way it
+  might sound: nothing stops a plugin from simply returning a version
+  number inside the supported range regardless of what it actually
+  implements. The version check catches an honest-but-outdated plugin,
+  not a hostile one.
+- **A required export missing or having the wrong signature** — PARTIAL.
+  A missing required export is refused at load with a clear message
+  naming which one (verified with a real compiled `.so`). A present
+  export with the *wrong signature* (e.g. `hyperbug_plugin_read` taking
+  different arguments than the header declares) is **not** and cannot be
+  detected — there is no way to verify a C ABI function's real signature
+  from the dlopen side; calling it with the wrong signature is undefined
+  behavior, caught by nothing. This is inherent to C ABI loading, not a
+  gap specific to this implementation — the same is true of any
+  `dlopen`/`dlsym`-based plugin system in any language.
+
+## 10. WASM plugin loading
+
+**Attacker**: an untrusted or buggy `.wasm` module — unlike item 9, this
+surface *does* have a meaningful trust boundary to defend, since
+`wasmtime`'s sandboxing is a real isolation mechanism, not "trust by
+design."
+**Reachable code**: `wasm_plugin.rs`.
+
+- **Isolating a module's own code from the rest of the process's memory**
+  — DEFENDED, by `wasmtime` itself. A module can only address its own
+  linear memory (verified: the `a_wasm_plugin_handles_read_write_
+  through_the_sandbox` test's out-of-register-file reads return zero
+  rather than adjacent process memory) — there is no instruction in the
+  WASM instruction set that reaches outside it.
+- **A module growing its own memory without bound** — DEFENDED. A real,
+  enforced ceiling (`wasmtime::StoreLimits`, 64 MiB) fails `memory.grow`
+  cleanly inside the module rather than the host process actually
+  allocating unbounded memory.
+- **A module's DMA calls reaching guest memory outside an operator-
+  declared confinement range** — DEFENDED. Same shared
+  `device::dma_range_allows` check every other transport uses, enforced
+  inside the `host_read_mem`/`host_write_mem` host functions before any
+  guest memory is touched.
+- **A module claiming a required export it doesn't actually have, or
+  with the wrong signature** — DEFENDED, and a genuine improvement over
+  the native transport's item 9 (PARTIAL there): `wasmtime`'s
+  `get_typed_func` checks the *real* signature at load time (verified:
+  `a_plugin_missing_a_required_export_fails_to_load_cleanly`) — there is
+  no C-ABI-style "wrong signature is undefined behavior" gap here at all,
+  since WASM's own type system carries real signature information, unlike
+  a bare `dlsym` symbol.
+- **A malicious or buggy module claiming ABI compatibility it doesn't
+  have** — same PARTIAL as item 9's equivalent case: the version check
+  (verified: `a_mismatched_abi_version_is_refused_at_load`) catches an
+  honest-but-outdated module, not one that lies about its own version
+  while implementing something else.
+- **Isolating `wasmtime` itself (the JIT/runtime) from the rest of the
+  process** — HELD, by necessity: no OS process boundary exists for this
+  transport, unlike sandboxed Python. A `wasmtime`-level bug (not the
+  loaded module's own code) is, in principle, still a risk to the whole
+  `hyperbug` process. This is the honest trade the WASM transport makes
+  in exchange for in-process speed — see `security.md`'s trust-tier 6.
 
 ---
 
@@ -264,7 +393,23 @@ Reading this list top to bottom:
 6. A real guest-facing IOMMU / DMA remapping model (distinct from the
    existing operator-side plugin DMA confinement).
 
-These map directly onto Tier 2's six items from the ongoing hardening
+Items 1-6 map directly onto Tier 2's six items from the ongoing hardening
 plan. As each is closed with real, verified work, update its entry above
 from HELD to DEFENDED with what specifically closed it — the same
 discipline the rest of this project's history holds itself to.
+
+Item 9 (native plugin isolation) is a **standing, by-design HELD** —
+listed for honesty, not tracked as a bug to eventually close, since
+closing it would mean building an entirely different loading mechanism
+(an out-of-process native plugin host). Anyone loading a
+`--native-device`/`--native-pci-device` plugin should treat that HELD as
+permanent, not pending.
+
+Item 10 (WASM plugin loading) is mostly DEFENDED — real, `wasmtime`-
+enforced sandboxing of a module's own code, a genuine step up from item
+9's native transport on several specific points (signature checking,
+memory-growth bounds). Its one HELD sub-item (no OS process boundary
+around `wasmtime` itself) is, like item 9's, a standing trade rather than
+a bug: closing it would mean running `wasmtime` in a subprocess too, at
+which point it's no longer offering in-process speed over the existing
+sandboxed-Python transport.

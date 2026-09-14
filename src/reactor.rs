@@ -35,7 +35,8 @@
 //! same way as everything else — see `handle_blk_completion`.
 
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -43,10 +44,13 @@ use crate::error::{ExitSlot, GuestExit, request_exit};
 use crate::irq::IrqRegistry;
 use crate::machine::SharedState;
 use crate::pci::PciDevice;
+use crate::record::{EventKind, Recorder};
 use crate::serial;
 use crate::tty;
-use crate::virtio::{VirtioDeviceOps, VirtioLegacyPci};
+use crate::virtio::{VirtioDeviceOps, VirtioLegacyPci, VirtioModernPci};
 use crate::virtio_blk::VirtioBlk;
+use crate::virtio_gpio::VirtioGpio;
+use crate::virtio_vsock::VirtioVsock;
 use crate::virtio_net::{RX_QUEUE, VNET_HDR_LEN, VirtioNet};
 
 /// One `ioevent_entries()` binding this reactor watches: the `EventFd`
@@ -80,8 +84,97 @@ const QUIESCENT_TIMEOUT_MS: i32 = 200;
 const RX_BUF_LEN: usize = 65536;
 const STDIN_BUF_LEN: usize = 256;
 
+/// How long `ReactorPause::request_and_wait` waits for the reactor thread
+/// to actually reach a safe (not mid-critical-section) point before
+/// giving up — see `ReactorPause`'s own doc comment for why this exists
+/// at all (`fork.rs`).
+const PAUSE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PauseState {
+    Running,
+    Requested,
+    Paused,
+}
+
+/// A real, tested rendezvous the reactor thread checks once per loop
+/// iteration (before touching any lock), letting another thread — only
+/// `fork.rs`, today — know for certain the reactor isn't mid-critical-
+/// section before doing something that would otherwise risk it: `fork()`
+/// only clones the *calling* thread, so if the reactor thread happened to
+/// be holding `SharedState`'s lock (or any other) at the exact instant of
+/// a fork, that lock would be permanently stuck in the child with no
+/// owning thread ever able to release it. This exists specifically so
+/// `fork.rs` can pause the reactor at a genuinely safe point, fork, and
+/// resume it — rather than "just fork and hope," which this project's own
+/// history (item 9's segfault, item 35's wakeup-ticker regression) has
+/// already shown is not a real strategy for a concurrency-adjacent
+/// feature.
+#[derive(Clone)]
+pub struct ReactorPause {
+    inner: Arc<(Mutex<PauseState>, Condvar)>,
+}
+
+impl ReactorPause {
+    pub fn new() -> Self {
+        Self { inner: Arc::new((Mutex::new(PauseState::Running), Condvar::new())) }
+    }
+
+    /// Called only by the reactor thread itself, once per loop iteration,
+    /// before doing anything else. A no-op (returns immediately) unless a
+    /// pause has actually been requested.
+    fn check_in(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut state = lock.lock().unwrap();
+        if *state != PauseState::Requested {
+            return;
+        }
+        *state = PauseState::Paused;
+        cvar.notify_all();
+        while *state == PauseState::Paused {
+            state = cvar.wait(state).unwrap();
+        }
+    }
+
+    /// Requests a pause and blocks until the reactor thread has actually
+    /// reached one (or `PAUSE_ACK_TIMEOUT` elapses). Returns `false` on
+    /// timeout — the caller (`fork.rs`) must not proceed with `fork()` in
+    /// that case, since the reactor's true state is then unknown.
+    pub fn request_and_wait(&self) -> bool {
+        let (lock, cvar) = &*self.inner;
+        let mut state = lock.lock().unwrap();
+        *state = PauseState::Requested;
+        let (mut state, timed_out) =
+            cvar.wait_timeout_while(state, PAUSE_ACK_TIMEOUT, |s| *s != PauseState::Paused).unwrap();
+        if timed_out.timed_out() {
+            *state = PauseState::Running; // withdraw the request
+            cvar.notify_all();
+            return false;
+        }
+        true
+    }
+
+    /// Resumes a paused reactor thread. Called by `fork.rs` in the
+    /// *parent* only — the child never had a reactor thread of its own
+    /// at all (fork only clones the calling thread), and spawns a
+    /// completely fresh one instead.
+    pub fn resume(&self) {
+        let (lock, cvar) = &*self.inner;
+        *lock.lock().unwrap() = PauseState::Running;
+        cvar.notify_all();
+    }
+}
+
+impl Default for ReactorPause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 type NetDevice = Arc<Mutex<VirtioLegacyPci<VirtioNet>>>;
 type BlkDevice = Arc<Mutex<VirtioLegacyPci<VirtioBlk>>>;
+type GpioDevice = Arc<Mutex<VirtioModernPci<VirtioGpio>>>;
+type VsockDevice = Arc<Mutex<VirtioModernPci<VirtioVsock>>>;
 
 /// Whether stdin can still produce bytes. A closed pipe or file reports
 /// itself readable to `epoll` forever, so it has to be unwatched rather
@@ -92,17 +185,36 @@ enum StdinState {
     Closed,
 }
 
-pub fn spawn(
-    shared: Arc<Mutex<SharedState>>,
-    exit_slot: ExitSlot,
-    irqs: Arc<IrqRegistry>,
-    net_devices: Vec<NetDevice>,
-    virtio_notifies: Vec<VirtioNotifyTarget>,
-    blk_devices: Vec<BlkDevice>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        Reactor::new(shared, exit_slot, irqs, net_devices, virtio_notifies, blk_devices).run()
-    })
+/// Bundles `spawn`'s parameters — matches `vcpu.rs`'s own `VcpuEnv`
+/// convention, needed once `--record`/`--replay` pushed the plain
+/// parameter list past clippy's arity lint.
+pub struct ReactorConfig {
+    pub shared: Arc<Mutex<SharedState>>,
+    pub exit_slot: ExitSlot,
+    pub irqs: Arc<IrqRegistry>,
+    pub net_devices: Vec<NetDevice>,
+    pub virtio_notifies: Vec<VirtioNotifyTarget>,
+    pub blk_devices: Vec<BlkDevice>,
+    /// Every virtio-gpio adapter, for the same reason `blk_devices` is
+    /// handed over: the reactor polls each one's completion eventfd to
+    /// finish a guest-armed `eventq` buffer once a real interrupt fires
+    /// (`VirtioGpio`'s module doc comment) — see `handle_gpio_completion`.
+    pub gpio_devices: Vec<GpioDevice>,
+    /// The one optional virtio-vsock adapter's bridge-thread eventfd —
+    /// see `VirtioVsock`'s module doc comment and
+    /// `handle_vsock_bridge`.
+    pub vsock_device: Option<VsockDevice>,
+    pub recorder: Option<Arc<Recorder>>,
+    /// `true` under `--replay` — see `Reactor::suppress_stdin`'s own doc
+    /// comment.
+    pub suppress_stdin: bool,
+    /// The rendezvous `fork.rs` uses to pause this reactor thread at a
+    /// safe point before forking — see `ReactorPause`'s own doc comment.
+    pub pause: ReactorPause,
+}
+
+pub fn spawn(config: ReactorConfig) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || Reactor::new(config).run())
 }
 
 /// Owns the epoll fd for its whole lifetime, so every early return closes
@@ -164,33 +276,68 @@ struct Reactor {
     net_devices: Vec<NetDevice>,
     virtio_notifies: Vec<VirtioNotifyTarget>,
     blk_devices: Vec<BlkDevice>,
+    gpio_devices: Vec<GpioDevice>,
+    vsock_device: Option<VsockDevice>,
+    /// `Some` only when `--record` was given — see `record.rs`. Tagging
+    /// every keyboard byte/TAP packet with a branch-count position is
+    /// cheap enough (one syscall read on an already-open fd) to do
+    /// unconditionally when present, so no separate "is recording on"
+    /// check gates the call sites below beyond this being `Some`.
+    recorder: Option<Arc<Recorder>>,
+    /// `true` under `--replay`: real stdin is never watched, since
+    /// keyboard input comes from the recording instead (delivered from
+    /// `vcpu.rs`'s own poll loop). TAP is still watched regardless —
+    /// network replay isn't implemented yet.
+    suppress_stdin: bool,
+    pause: ReactorPause,
 }
 
 impl Reactor {
-    fn new(
-        shared: Arc<Mutex<SharedState>>,
-        exit_slot: ExitSlot,
-        irqs: Arc<IrqRegistry>,
-        net_devices: Vec<NetDevice>,
-        virtio_notifies: Vec<VirtioNotifyTarget>,
-        blk_devices: Vec<BlkDevice>,
-    ) -> Self {
-        Self { shared, exit_slot, irqs, net_devices, virtio_notifies, blk_devices }
+    fn new(config: ReactorConfig) -> Self {
+        let ReactorConfig {
+            shared,
+            exit_slot,
+            irqs,
+            net_devices,
+            virtio_notifies,
+            blk_devices,
+            gpio_devices,
+            vsock_device,
+            recorder,
+            suppress_stdin,
+            pause,
+        } = config;
+        Self {
+            shared,
+            exit_slot,
+            irqs,
+            net_devices,
+            virtio_notifies,
+            blk_devices,
+            gpio_devices,
+            vsock_device,
+            recorder,
+            suppress_stdin,
+            pause,
+        }
     }
 
     fn run(&self) {
         let epoll = match Epoll::create() {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[hyperbug] reactor: epoll_create1 failed: {e}");
+                crate::log_error!("reactor: epoll_create1 failed: {e}");
                 return;
             }
         };
         // Not fatal: a guest whose stdin is a regular file (epoll refuses
         // those with EPERM) still runs perfectly well, just without
-        // console input.
-        if let Err(e) = epoll.add(STDIN_FD, STDIN_TOKEN) {
-            eprintln!("[hyperbug] reactor: stdin isn't pollable ({e}); console input is disabled");
+        // console input. Never watched at all under `--replay` — see
+        // `suppress_stdin`'s own doc comment.
+        if !self.suppress_stdin
+            && let Err(e) = epoll.add(STDIN_FD, STDIN_TOKEN)
+        {
+            crate::log_warn!("reactor: stdin isn't pollable ({e}); console input is disabled");
         }
 
         // A fixed set decided at launch (no device hot-plug), so
@@ -205,14 +352,14 @@ impl Reactor {
         for (i, net) in self.net_devices.iter().enumerate() {
             let fd = net.lock().unwrap().device_mut().tap_mut().as_raw_fd();
             if let Err(e) = epoll.add(fd, i as u64 + 1) {
-                eprintln!("[hyperbug] reactor: couldn't watch TAP fd {fd}: {e}");
+                crate::log_error!("reactor: couldn't watch TAP fd {fd}: {e}");
             }
         }
         let virtio_notify_base = self.net_devices.len() as u64 + 1;
         for (i, target) in self.virtio_notifies.iter().enumerate() {
             let fd = target.eventfd.as_raw_fd();
             if let Err(e) = epoll.add(fd, virtio_notify_base + i as u64) {
-                eprintln!("[hyperbug] reactor: couldn't watch virtio ioeventfd {fd}: {e}");
+                crate::log_error!("reactor: couldn't watch virtio ioeventfd {fd}: {e}");
             }
         }
         let blk_completion_base = virtio_notify_base + self.virtio_notifies.len() as u64;
@@ -221,7 +368,23 @@ impl Reactor {
             if let Some(fd) = fd
                 && let Err(e) = epoll.add(fd, blk_completion_base + i as u64)
             {
-                eprintln!("[hyperbug] reactor: couldn't watch virtio-blk completion fd {fd}: {e}");
+                crate::log_error!("reactor: couldn't watch virtio-blk completion fd {fd}: {e}");
+            }
+        }
+        let gpio_completion_base = blk_completion_base + self.blk_devices.len() as u64;
+        for (i, gpio) in self.gpio_devices.iter().enumerate() {
+            let fd = gpio.lock().unwrap().device_mut().completion_eventfd();
+            if let Some(fd) = fd
+                && let Err(e) = epoll.add(fd, gpio_completion_base + i as u64)
+            {
+                crate::log_error!("reactor: couldn't watch virtio-gpio completion fd {fd}: {e}");
+            }
+        }
+        let vsock_token = gpio_completion_base + self.gpio_devices.len() as u64;
+        if let Some(vsock) = &self.vsock_device {
+            let fd = vsock.lock().unwrap().device_mut().bridge_eventfd();
+            if let Err(e) = epoll.add(fd, vsock_token) {
+                crate::log_error!("reactor: couldn't watch virtio-vsock bridge fd {fd}: {e}");
             }
         }
 
@@ -231,6 +394,11 @@ impl Reactor {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
 
         while !self.exit_slot.is_requested() {
+            // Checked before touching any lock or doing any dispatch —
+            // see `ReactorPause`'s own doc comment for why this specific
+            // point (not mid-event-handling) is the only safe place to
+            // park for a pending `fork()`.
+            self.pause.check_in();
             for ev in epoll.wait(&mut events, QUIESCENT_TIMEOUT_MS) {
                 // Copied out before matching: a match guard reading a
                 // packed struct's field directly (`epoll_event` is
@@ -253,9 +421,19 @@ impl Reactor {
                             self.handle_virtio_notify(target);
                         }
                     }
-                    token => {
+                    token if token < gpio_completion_base => {
                         if let Some(blk) = self.blk_devices.get((token - blk_completion_base) as usize) {
                             self.handle_blk_completion(blk);
+                        }
+                    }
+                    token if token < vsock_token => {
+                        if let Some(gpio) = self.gpio_devices.get((token - gpio_completion_base) as usize) {
+                            self.handle_gpio_completion(gpio);
+                        }
+                    }
+                    _ => {
+                        if let Some(vsock) = &self.vsock_device {
+                            self.handle_vsock_bridge(vsock);
                         }
                     }
                 }
@@ -278,7 +456,8 @@ impl Reactor {
             }
             if let Some(pos) = buf[..n].iter().position(|&b| b == ESCAPE_BYTE) {
                 self.push_rx(&buf[..pos]);
-                eprintln!("\r\n[hyperbug] Ctrl-] pressed, exiting");
+                eprint!("\r\n");
+                crate::log_info!("Ctrl-] pressed, exiting");
                 request_exit(&self.exit_slot, Ok(GuestExit::UserQuit));
                 return StdinState::Open;
             }
@@ -292,6 +471,9 @@ impl Reactor {
     fn push_rx(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+        if let Some(recorder) = &self.recorder {
+            recorder.record(EventKind::KeyboardRx, bytes);
         }
         let mut wants_irq = false;
         {
@@ -344,6 +526,56 @@ impl Reactor {
         }
     }
 
+    /// A virtio-gpio bank's Python plugin has called
+    /// `self.hyperbug.raise_irq(line)` — completes whichever `eventq`
+    /// buffer was armed for that line (if any) and raises the adapter's
+    /// interrupt. Same shape as `handle_blk_completion`, driven by the
+    /// same `ChainOutcome::Pending`/`poll_completions` machinery, just
+    /// triggered by a plugin call instead of an io_uring completion.
+    fn handle_gpio_completion(&self, gpio: &GpioDevice) {
+        let mut device = gpio.lock().unwrap();
+        if let Some(fd) = device.device_mut().completion_eventfd() {
+            let mut discard = [0u8; 8];
+            // SAFETY: `fd` is a valid, open eventfd for as long as this
+            // `VirtioGpio` (whose lock we're holding) is alive; reading
+            // exactly 8 bytes is the eventfd read protocol.
+            unsafe {
+                libc::read(fd, discard.as_mut_ptr().cast(), discard.len());
+            }
+        }
+        if let Some(irq) = device.drain_completions() {
+            self.irqs.pulse(irq);
+        }
+    }
+
+    /// The virtio-vsock bridge thread has real data, a closed connection,
+    /// or a freshly-flushed credit-unblocked backlog to report — drains
+    /// it into fully-formed packets and delivers each directly via
+    /// `try_deliver_async` (not `drain_completions`/`CompletionResult`,
+    /// which only ever writes a single status byte — see
+    /// `VirtioVsock`'s own module doc comment on its two delivery paths).
+    fn handle_vsock_bridge(&self, vsock: &VsockDevice) {
+        let mut device = vsock.lock().unwrap();
+        let fd = device.device_mut().bridge_eventfd();
+        let mut discard = [0u8; 8];
+        // SAFETY: `fd` is a valid, open eventfd for as long as this
+        // `VirtioVsock` (whose lock we're holding) is alive.
+        unsafe {
+            libc::read(fd, discard.as_mut_ptr().cast(), discard.len());
+        }
+        let packets = device.device_mut().drain_bridge_events();
+        let mut irq_to_pulse = None;
+        for bytes in packets {
+            if let Some(irq) = device.try_deliver_async(crate::virtio_vsock::RX_QUEUE, &bytes) {
+                irq_to_pulse = Some(irq);
+            }
+        }
+        drop(device);
+        if let Some(irq) = irq_to_pulse {
+            self.irqs.pulse(irq);
+        }
+    }
+
     fn handle_tap(&self, net: &NetDevice, rx_buf: &mut [u8], rx_header: &[u8]) {
         let mut net = net.lock().unwrap();
         // Drain every queued packet, not just the first: a burst used to
@@ -353,7 +585,16 @@ impl Reactor {
                 return;
             };
             match net.try_deliver_rx(RX_QUEUE, rx_header, &rx_buf[..n]) {
-                Some(irq) => self.irqs.pulse(irq),
+                Some(irq) => {
+                    // Recorded only on an actual delivery — a packet the
+                    // guest never got (no RX buffer posted, the `None`
+                    // arm below) never reached it and has nothing to
+                    // replay.
+                    if let Some(recorder) = &self.recorder {
+                        recorder.record(EventKind::NetRx, &rx_buf[..n]);
+                    }
+                    self.irqs.pulse(irq);
+                }
                 // The guest hasn't posted an RX buffer; the packet is
                 // dropped, exactly as a real NIC would under buffer
                 // exhaustion. Stop draining rather than spin reading

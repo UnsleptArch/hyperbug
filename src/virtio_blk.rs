@@ -388,6 +388,10 @@ impl VirtioDeviceOps for VirtioBlk {
         0x1001 // "Virtio block device", per /usr/share/hwdata/pci.ids
     }
 
+    fn virtio_device_type(&self) -> u16 {
+        2 // VIRTIO_ID_BLOCK, per <linux/virtio_ids.h>
+    }
+
     fn pci_class_code(&self) -> u32 {
         0x01_80_00 // mass storage controller, other
     }

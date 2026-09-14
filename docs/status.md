@@ -20,15 +20,58 @@ this."
   INIT-SIPI-SIPI sequence, not a faked CPU count.
 - virtio-blk (legacy transport, real io_uring-backed async I/O),
   virtio-net (a real host TAP interface), virtio-rng (legacy and modern
-  virtio 1.0 transports).
+  virtio 1.0 transports), virtio-i2c (modern transport only, a real
+  guest-facing I2C bus with a Python-pluggable target-device ABI —
+  `--i2c-device`), virtio-gpio (modern transport only, real interrupts via
+  the guest's own `eventq` — `--gpio-device`).
+- Real SMBIOS/DMI tables (BIOS/System/Chassis + End-of-Table), always
+  present like ACPI — verified against a real, unmodified kernel's own
+  `/sys/class/dmi/id/*`.
+- Multi-UART: up to three additional real 16550 ports (COM2/COM3/COM4,
+  `--uart2-log`/`--uart3-log`/`--uart4-log`), output-only, sharing IRQs
+  the same way real ISA hardware does — verified against the real 8250
+  driver binding `ttyS1` and a genuine userspace write landing in the
+  host capture file.
+- virtio-vsock (`--vsock-uds`): a real host↔guest control channel — every
+  guest-initiated `AF_VSOCK` stream bridges to one host Unix domain
+  socket, with real credit-based flow control. Verified against the real
+  `AF_VSOCK` guest driver stack: a genuine `connect()`/`write()`/`read()`
+  round-tripped through a real `socat` echo server on the host side.
 - A real interactive console over a real PTY, keystrokes delivered via a
   real epoll-driven reactor and irqfd, not a polling loop.
 - Live control-socket access to a running guest's memory and registers
   from a separate process, and a real snapshot/restore round trip.
-- Python device plugins, both in-process (PyO3) and sandboxed
-  (subprocess-isolated), with real DMA, spontaneous interrupts, PCI
-  identity/MSI, and an opt-in `tick()` hook — all exercised by both unit
-  tests and, where it matters, real boot tests.
+- Device plugins in four forms — in-process Python (PyO3), sandboxed
+  Python (subprocess-isolated), native C ABI (`dlopen()`), and WASM
+  (`wasmtime`) — sharing one `Device`/`PciDevice` implementation
+  (`plugin::ScriptedDevice`) regardless of transport, with real DMA,
+  spontaneous interrupts, PCI identity/MSI, and opt-in `tick()`/`reset()`
+  hooks. Verified for all four transports, including a real
+  compiled-on-the-fly C plugin doing genuine DMA/IRQ/tick/reset through
+  the native ABI, and a real compiled-on-the-fly WASM module doing the
+  same through `wasmtime`'s sandbox (a real live boot with
+  `--wasm-pci-device`, enumerated cleanly by the guest's PCI core, plus
+  live `reset_device`/`reload_device` against it over the control
+  socket).
+- Hot-reload: a live plugin (any of the four transports) can be
+  re-read from disk and swapped into its existing address/BAR slot
+  without restarting the guest, via the control socket's `reload_device`
+  command — verified with a real edited-on-disk plugin file (Python and
+  native both), not just a synthetic swap.
+- A real GDB/LLDB remote-debugging stub (`--gdb-stub`): real software
+  breakpoints, single-stepping, and register/memory access against a live
+  vCPU over the standard RSP protocol — see
+  [debugging.md](debugging.md#gdbllvm-remote-debugging) for its scope
+  (BSP-only, software breakpoints only).
+- Chrome Trace Event Format export (`--trace-file`) and automatic
+  triple-fault crash post-mortem dumps (`--crash-dir`) — see
+  [debugging.md](debugging.md).
+- Record-and-replay (`--record`/`--replay`): real keyboard and virtio-rng
+  replay, verified end-to-end (record a session, replay it on a
+  completely separate boot) across 16 consecutive real runs after fixing
+  a genuine reliability bug the same testing caught. Poll-granularity,
+  not cycle-exact. TAP packets are recorded but not replayed yet. See
+  [record-replay.md](record-replay.md).
 
 All of the above has at least one automated test that exercises it
 against real `/dev/kvm` (`tests/boot.rs`), not just unit-level logic —
@@ -49,9 +92,11 @@ run `cargo test --release` to reproduce this yourself.
   guest-facing IOMMU, and not a general privilege sandbox. See
   [security.md](security/security.md) for exactly what it does and doesn't cover.
 - **Sandboxed plugins**: isolate a hang/crash from taking down the guest
-  or VMM, and now run under a real seccomp-bpf deny-list (see "Security
-  hardening" below) — but that's a targeted syscall block, not a full
-  privilege sandbox (no namespace/capability drop/UID change).
+  or VMM, run under a real seccomp-bpf deny-list, and can optionally get
+  a cgroups-v2 memory/CPU ceiling (see "Security hardening" below) — but
+  none of that is a full privilege sandbox (no namespace/capability
+  drop/UID change), and the resource limits specifically are
+  best-effort, unenforced without cgroups v2 delegation.
 - **CPUID curation**: a small number of specific, evidence-checked
   corrections (MONITOR/MWAIT, HTT/thread-count leakage, APIC ID/thread
   count in a couple of leaves) layered on raw host pass-through — not a
@@ -84,6 +129,12 @@ A dedicated pass beyond ordinary feature testing — see
   primitives — not a full sandbox (no namespace/capability drop), and not
   yet extended to the main VMM process (which embeds a full CPython
   interpreter via PyO3, a harder syscall-filtering target).
+- **Per-plugin resource limits** (`src/cgroup.rs`) — an optional
+  cgroups-v2 memory ceiling and/or CPU quota, per sandboxed plugin
+  instance, joined by the child before `exec` so there's no unconfined
+  window. Best-effort by necessity, not by choice: silently unenforced
+  (with a stderr warning) without cgroups v2 delegation — the actual,
+  verified case on this project's own dev host.
 - **[defendmap.md](security/defendmap.md)** is the living, per-surface
   attack-surface map — every place untrusted bytes reach hyperbug's code,
   and whether that specific surface is defended, partially defended, or
@@ -109,6 +160,12 @@ A dedicated pass beyond ordinary feature testing — see
   breaking-change bump for the plugin ABI specifically; the CLI/Rust
   embedding surface (`Args`, `run()`) has no separate versioning scheme
   yet.
+- No TAP-packet replay (recorded, not replayed) and no cycle-exact
+  timing — record-and-replay's keyboard/RNG replay is real and
+  end-to-end verified (`--record`/`--replay`), but poll-granularity, not
+  cycle-exact, and KVM's own in-kernel timer interrupts are a permanent
+  structural gap this design can't reach at all. See
+  [record-replay.md](record-replay.md) and `DEBTS.md` items 49-52.
 
 ## Continuous integration
 

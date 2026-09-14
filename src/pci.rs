@@ -48,6 +48,14 @@ const REG_ID: u16 = 0x00;
 const REG_COMMAND_STATUS: u16 = 0x04;
 const REG_CLASS: u16 = 0x08;
 const REG_HEADER_TYPE: u16 = 0x0c;
+/// Subsystem Vendor ID (low word) / Subsystem ID (high word). Real,
+/// load-bearing for legacy virtio: `virtio_pci_legacy_dev.c` reads a
+/// device's virtio device-type id (net=1, block=2, rng=4, ...) from
+/// *this* register, not the PCI Device ID — a legacy virtio device whose
+/// Subsystem ID reads back 0 (this emulation's behavior before this field
+/// existed) matches no driver's `MODULE_DEVICE_TABLE` at all, silently.
+/// See `PciDevice::subsystem_vendor_id`/`subsystem_device_id`.
+const REG_SUBSYSTEM: u16 = 0x2c;
 const REG_CAPABILITIES_PTR: u16 = 0x34;
 const REG_INTERRUPT: u16 = 0x3c;
 
@@ -61,6 +69,28 @@ const STATUS_CAP_LIST: u16 = 0x0010;
 pub trait PciDevice: Send {
     fn vendor_id(&self) -> u16;
     fn device_id(&self) -> u16;
+    /// PCI Subsystem Vendor ID (config offset 0x2c, low word). `0` (the
+    /// default, matching every non-virtio device here — a `--pci-device`
+    /// plugin, the host bridge) means "not set," same as real hardware
+    /// that doesn't populate it. **Load-bearing for legacy virtio**: see
+    /// `subsystem_device_id`.
+    fn subsystem_vendor_id(&self) -> u16 {
+        0
+    }
+    /// PCI Subsystem ID (config offset 0x2e, high word of the same
+    /// register `subsystem_vendor_id` occupies the low word of). For a
+    /// legacy-transitional virtio device this **must** be the real virtio
+    /// device-type id (net=1, block=2, rng=4, ...) — `virtio_pci_legacy_
+    /// dev.c` reads `vdev.id.device` directly from this field, and every
+    /// virtio driver's `MODULE_DEVICE_TABLE` alias match
+    /// (`virtio:d00000001v*` for net, etc.) depends on it being right.
+    /// Leaving this at its default (0, matching every non-virtio device)
+    /// on a virtio device means no driver ever binds — silently, with no
+    /// error anywhere, exactly the bug this comment exists to prevent a
+    /// future device from reintroducing.
+    fn subsystem_device_id(&self) -> u16 {
+        0
+    }
     fn class_code(&self) -> u32; // class/subclass/prog-if, in the standard 24-bit packing
     /// Sizes of implemented BARs; index absent or 0 means "not implemented".
     fn bar_sizes(&self) -> [u32; NUM_BARS];
@@ -195,6 +225,8 @@ impl Device for HostBridge {
 struct PciIdentity {
     vendor_id: u16,
     device_id: u16,
+    subsystem_vendor_id: u16,
+    subsystem_device_id: u16,
     class_code: u32,
     revision_id: u8,
     interrupt_line: u8,
@@ -208,6 +240,8 @@ impl PciIdentity {
         Self {
             vendor_id: dev.vendor_id(),
             device_id: dev.device_id(),
+            subsystem_vendor_id: dev.subsystem_vendor_id(),
+            subsystem_device_id: dev.subsystem_device_id(),
             class_code: dev.class_code(),
             revision_id: dev.revision_id(),
             interrupt_line: dev.interrupt_line(),
@@ -444,6 +478,7 @@ impl PciBus {
             }
             REG_CLASS => (id.class_code << 8) | u32::from(id.revision_id),
             REG_HEADER_TYPE => 0, // header type 0, no BIST/latency/cache-line
+            REG_SUBSYSTEM => (u32::from(id.subsystem_device_id) << 16) | u32::from(id.subsystem_vendor_id),
             REG_CAPABILITIES_PTR if id.msi_capable => u32::from(MSI_CAP_OFFSET),
             REG_CAPABILITIES_PTR if !id.extra_caps.is_empty() => u32::from(EXTRA_CAP_OFFSET),
             REG_INTERRUPT => u32::from(id.interrupt_line) | (u32::from(id.interrupt_pin) << 8),
@@ -582,7 +617,7 @@ impl PciBus {
             if let Some(old_addr) = binding.registered_addr.take() {
                 let addr = if is_io { IoEventAddress::Pio(old_addr) } else { IoEventAddress::Mmio(old_addr) };
                 if let Err(e) = vm.unregister_ioevent(&binding.eventfd, &addr, binding.datamatch) {
-                    eprintln!("[hyperbug] unregistering stale ioeventfd at {old_addr:#x}: {e}");
+                    crate::log_error!("unregistering stale ioeventfd at {old_addr:#x}: {e}");
                 }
             }
             if base != 0 {
@@ -590,7 +625,7 @@ impl PciBus {
                 let addr = if is_io { IoEventAddress::Pio(new_addr) } else { IoEventAddress::Mmio(new_addr) };
                 match vm.register_ioevent(&binding.eventfd, &addr, binding.datamatch) {
                     Ok(()) => binding.registered_addr = Some(new_addr),
-                    Err(e) => eprintln!("[hyperbug] registering ioeventfd at {new_addr:#x}: {e}"),
+                    Err(e) => crate::log_error!("registering ioeventfd at {new_addr:#x}: {e}"),
                 }
             }
         }

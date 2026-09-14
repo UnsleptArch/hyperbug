@@ -10,19 +10,31 @@ Rust doc comment.
 
 from abc import ABC, abstractmethod
 
-#: Bumped only when a *breaking* change is made to the `Device`/`PciDevice`
+#: The newest plugin ABI version this hyperbug build implements. Bumped
+#: only when a *breaking* change is made to the `Device`/`PciDevice`
 #: contract itself (a required method's signature, the meaning of an
 #: existing attribute, ...) — not for additions like `tick()`, which are
 #: purely opt-in and never break an existing plugin that doesn't define
 #: them. `Device`/`PciDevice` subclasses pick this up automatically as
-#: `self.hyperbug_api_version`; hyperbug's Rust side checks it once at load
-#: (see `src/pydevice.rs`) and refuses to load a plugin that declares a
-#: version other than what this build implements, rather than silently
-#: running it against a contract that's since changed underneath it. A
-#: plugin that doesn't subclass `Device` at all (duck-typing is explicitly
-#: supported — see the module docstring) has no version to check, and
-#: loads exactly as before this existed.
+#: `self.hyperbug_api_version`; hyperbug's Rust side checks it once at
+#: load (see `src/pydevice.rs`/`src/pydevice_proc.rs`) against the
+#: inclusive range `[HYPERBUG_API_MIN_SUPPORTED, HYPERBUG_API_VERSION]` —
+#: declaring something newer means the plugin needs a newer hyperbug;
+#: declaring something older than `HYPERBUG_API_MIN_SUPPORTED` means
+#: hyperbug has since dropped support for that contract. Either fails
+#: loudly at load, saying which, instead of silently running the plugin
+#: against a shape it never agreed to. A plugin that doesn't subclass
+#: `Device` at all (duck-typing is explicitly supported — see the module
+#: docstring) has no version to check, and loads exactly as before this
+#: existed.
 HYPERBUG_API_VERSION = 1
+
+#: The oldest `hyperbug_api_version` a plugin may declare and still be
+#: accepted — see `HYPERBUG_API_VERSION` above. Equal to it today (only
+#: one contract has ever existed); bumped only alongside
+#: `HYPERBUG_API_VERSION` when an old, numbered contract can no longer be
+#: supported.
+HYPERBUG_API_MIN_SUPPORTED = 1
 
 
 class Device(ABC):
@@ -108,6 +120,22 @@ class Device(ABC):
     #         See `devices/doorbell_demo.py` for a worked example of the
     #         latter."""
 
+    # `reset(self) -> None` is *not* defined here either, same reasoning
+    # and same opt-in check (`HAS_RESET`) as `tick` above. The difference
+    # from `tick`: nothing in hyperbug calls this automatically — there's
+    # no in-guest reset trigger modeled today (no PCI function-level
+    # reset, no guest-driver-initiated reset). The only real caller is the
+    # live control socket's `reset_device <mmio|pci> <selector>` command
+    # (see `hyperbug.vm.ControlConnection.reset_device`) — an operator
+    # explicitly asking this specific device to reinitialize. If you want
+    # one, just add:
+    #
+    #     def reset(self) -> None:
+    #         """Reinitialize this device's internal state, analogous to
+    #         a real hardware reset line. Called only when an operator
+    #         explicitly asks for it via the control socket — never
+    #         automatically."""
+
 
 class PciDevice(Device):
     """A `Device` that also declares a PCI identity, for
@@ -167,3 +195,115 @@ class PciDevice(Device):
     #: *custom* device model with its own (real or hypothetical) driver
     #: that genuinely requests plain MSI.
     msi_capable: bool
+
+
+class I2cDevice(ABC):
+    """A target device on hyperbug's single virtual I2C bus.
+
+    Register with ``--i2c-device <path>:<ClassName>:<addr>`` (a 7-bit
+    address, 0x00-0x7f). The guest reaches this through a real
+    ``virtio-i2c`` adapter (``VIRTIO_ID_I2C_ADAPTER``) that its own
+    unmodified ``i2c-virtio`` kernel driver binds to -- no custom guest
+    driver needed, and no fixed register-offset addressing the way
+    `Device` has: I2C messages are just address + direction + a byte
+    buffer, matching the guest's own ``i2c_msg`` abstraction.
+
+    Unlike `Device`, an `I2cDevice` gets **no** ``self.hyperbug`` DMA
+    context -- it never sees guest memory directly, only the bytes of
+    whichever message was addressed to it. Also unlike `Device`, there's
+    no PCI identity to declare here: the *adapter* (one per hyperbug
+    process, created automatically the moment any `I2cDevice` is
+    attached) is what the guest's PCI core sees; individual targets are
+    invisible to PCI enumeration, exactly like real I2C peripherals.
+
+    Real I2C transactions frequently chain a write (setting an internal
+    "register pointer") immediately followed by a read (returning data
+    from that pointer) with no bus release in between -- the standard way
+    almost every real sensor works. hyperbug delivers `i2c_write`/
+    `i2c_read` calls to the *same* long-lived instance, strictly in the
+    order the guest issued them, which is enough for a stateful device to
+    implement that idiom correctly with nothing more than an instance
+    attribute (see `devices/i2c_temp_sensor.py` for a worked example) --
+    there's no separate "transaction" object or start/stop callback to
+    manage.
+    """
+
+    #: See `HYPERBUG_API_VERSION` above -- checked once at load, same as
+    #: `Device`.
+    hyperbug_api_version: int = HYPERBUG_API_VERSION
+
+    @abstractmethod
+    def i2c_write(self, data: bytes) -> None:
+        """Handle a write-direction message: `data` is exactly what the
+        guest wrote in one `i2c_msg` (may be empty -- a real I2C master
+        can issue a zero-length write purely to probe whether a device
+        answers this address at all; that case never reaches this
+        method, since hyperbug ACKs/NAKs a zero-length probe from
+        whether a device is registered at all, with no `i2c_write`/
+        `i2c_read` call either way)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def i2c_read(self, length: int) -> bytes:
+        """Return up to `length` bytes for a read-direction message.
+        Returning fewer than `length` bytes is fine (only the bytes you
+        return are transferred); returning more is truncated."""
+        raise NotImplementedError
+
+
+class GpioBank(ABC):
+    """One virtual GPIO chip on hyperbug's guest-facing GPIO surface.
+
+    Register with ``--gpio-device <path>:<ClassName>`` -- unlike
+    `I2cDevice` (many targets sharing one bus), each `GpioBank` gets its
+    own independent PCI slot and its own real ``virtio-gpio`` adapter
+    (``VIRTIO_ID_GPIO``), matching real BMC hardware's typically several
+    separate GPIO controllers rather than one shared bus.
+
+    Every instance also gets a ``self.hyperbug`` attribute (set right
+    after construction, same timing as `Device`'s) with exactly one
+    method: ``self.hyperbug.raise_irq(line)``, which marks `line` as
+    having spontaneously changed state. It's delivered to the guest as a
+    real interrupt only if that line currently has one armed (the guest
+    posted a buffer for it) and enabled (`IRQ_TYPE` isn't `NONE`) --
+    otherwise dropped, matching a real masked/disabled interrupt. This is
+    real eventfd-backed and thread-safe to call from anywhere, including
+    your own background Python thread (`threading.Timer`, a polling
+    loop) -- there's no per-iteration `tick()` hook the way `Device` has,
+    since this already covers the same need with no extra polling path.
+    """
+
+    #: See `HYPERBUG_API_VERSION` above.
+    hyperbug_api_version: int = HYPERBUG_API_VERSION
+
+    #: Number of lines this bank exposes. Fixed for the life of the bank
+    #: -- read once when the plugin is loaded.
+    ngpio: int
+
+    #: Optional per-line names, exposed to the guest via
+    #: `GPIO_V2_GET_LINEINFO_IOCTL`-shaped introspection. Either omit
+    #: entirely (no names offered at all -- the real driver never even
+    #: asks) or supply exactly `ngpio` entries.
+    names: list[str] = []
+
+    @abstractmethod
+    def get_direction(self, line: int) -> int:
+        """Return one of `hyperbug.gpio`'s `DIRECTION_NONE`/`DIRECTION_
+        OUT`/`DIRECTION_IN` for `line`."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_direction(self, line: int, direction: int) -> None:
+        """`direction` is one of `DIRECTION_NONE`/`DIRECTION_OUT`/
+        `DIRECTION_IN` -- already validated before this is called."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_value(self, line: int) -> int:
+        """Return 0 or 1 for `line`'s current value."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_value(self, line: int, value: int) -> None:
+        """`value` is 0 or 1 -- already masked before this is called."""
+        raise NotImplementedError

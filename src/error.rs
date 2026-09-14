@@ -100,6 +100,11 @@ pub enum GuestExit {
     /// at all, but reported through the same path since it's still "the
     /// run ended, here's why."
     UserQuit,
+    /// This process's guest was live-migrated away to a separate hyperbug
+    /// process via the control socket's `migrate <host:port>` command
+    /// (`migrate.rs`) — not a failure, and not a guest-driven exit either:
+    /// the guest is still running, just somewhere else now.
+    MigratedAway,
 }
 
 impl GuestExit {
@@ -115,6 +120,7 @@ impl GuestExit {
             Self::RequestedReboot => crate::acpi::exit_code::REQUESTED_REBOOT,
             Self::TripleFault => crate::acpi::exit_code::TRIPLE_FAULT,
             Self::UserQuit => 1,
+            Self::MigratedAway => crate::acpi::exit_code::MIGRATED_AWAY,
         }
     }
 }
@@ -191,6 +197,7 @@ mod tests {
         assert_eq!(GuestExit::CleanShutdown.code(), 0);
         assert_eq!(GuestExit::RequestedReboot.code(), 10);
         assert_eq!(GuestExit::TripleFault.code(), 11);
+        assert_eq!(GuestExit::MigratedAway.code(), 13);
         assert_eq!(HyperbugError::Config(String::new()).exit_code(), 2);
         assert_eq!(HyperbugError::Kvm(String::new()).exit_code(), 1);
     }

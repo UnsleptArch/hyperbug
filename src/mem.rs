@@ -80,6 +80,41 @@ impl GuestMemory {
         self.ptr.as_ptr()
     }
 
+    /// A read-only view of the entire guest memory mapping — used for a
+    /// bulk dump (`snapshot::write_to`, for both file-based snapshots and
+    /// live migration) where copying through `read_checked` into a second
+    /// buffer first would just duplicate a potentially multi-gigabyte
+    /// copy for no reason.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the mapping is exactly `self.size` bytes, exclusively
+        // owned by `self`, and valid for as long as `self` is (the same
+        // invariant every other accessor here already relies on).
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
+    }
+
+    /// Wraps an *already-mapped* region instead of creating a new one —
+    /// the mechanism `fork.rs`'s forked child uses to inherit guest memory
+    /// for free via `fork()`'s own copy-on-write semantics, instead of
+    /// allocating and copying a fresh region the size of guest RAM. After
+    /// a real `fork()`, the child's own page tables hold an independent
+    /// (if initially physically aliased) mapping at the same virtual
+    /// address — `munmap`ing it from this value's own `Drop` affects only
+    /// this process, never the parent's identical-looking mapping, since
+    /// the two processes' page tables are already fully independent by
+    /// the time either one modifies anything.
+    ///
+    /// SAFETY: `ptr`/`size` must be exactly what a prior `mmap` (or, for
+    /// the fork case, the same values inherited unchanged from one) still
+    /// validly maps for the *entire* lifetime of the returned `GuestMemory`
+    /// — the same contract `new`'s own `mmap` result already satisfies for
+    /// itself; the caller is asserting that contract still holds for a
+    /// region it didn't itself just create.
+    pub unsafe fn from_inherited_mapping(ptr: *mut u8, size: usize) -> Result<Self, HyperbugError> {
+        let ptr = NonNull::new(ptr)
+            .ok_or_else(|| HyperbugError::Io("from_inherited_mapping given a null pointer".to_string()))?;
+        Ok(Self { ptr, size })
+    }
+
     /// Total guest RAM, in bytes. Used to reject guest-supplied ranges
     /// (virtqueue descriptors) up front, before anything sizes a host-side
     /// buffer from them — see `virtio::VirtQueue::try_pop`.

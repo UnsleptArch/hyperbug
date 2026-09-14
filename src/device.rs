@@ -19,15 +19,29 @@
 
 use std::sync::{Arc, Mutex};
 
-/// The `Device`/`PciDevice` plugin ABI version this build implements — kept
-/// in lockstep with `python/hyperbug/device.py`'s `HYPERBUG_API_VERSION`,
-/// the single source of truth for what the number means and when to bump
-/// it. Checked once at plugin load time (`pydevice.rs`/`pydevice_proc.rs`)
-/// against a plugin's own `hyperbug_api_version` attribute, so a plugin
-/// written against a since-changed contract fails loudly at load instead
-/// of silently misbehaving against a `Device`/`PciDevice` shape that's
-/// moved out from under it.
+/// The newest `Device`/`PciDevice` plugin ABI version this build
+/// implements — kept in lockstep with `python/hyperbug/device.py`'s
+/// `HYPERBUG_API_VERSION`, the single source of truth for what each
+/// number meant and when it was introduced. A plugin's own
+/// `hyperbug_api_version` attribute (checked once at load time in
+/// `pydevice.rs`/`pydevice_proc.rs`) must fall in the inclusive range
+/// `[PLUGIN_API_MIN_SUPPORTED, PLUGIN_API_VERSION]` — declaring something
+/// newer means "this plugin needs a newer hyperbug than this build,"
+/// declaring something older than `PLUGIN_API_MIN_SUPPORTED` means "this
+/// plugin was written for a contract this build has since dropped
+/// support for." Either fails loudly at load, with a message saying
+/// which, instead of silently running the plugin against a
+/// `Device`/`PciDevice` shape it never agreed to.
 pub const PLUGIN_API_VERSION: u32 = 1;
+
+/// The oldest `hyperbug_api_version` a plugin may declare and still be
+/// accepted. Equal to `PLUGIN_API_VERSION` today (only one contract has
+/// ever existed) — bump this only when a plugin written against an old,
+/// numbered contract can no longer be supported, at the same time
+/// `PLUGIN_API_VERSION` is bumped for the new one. Until then, every
+/// plugin declaring any version in between continues to work exactly as
+/// it does today.
+pub const PLUGIN_API_MIN_SUPPORTED: u32 = 1;
 
 /// Whether `[addr, addr + len)` lies entirely within a device's declared
 /// DMA-confinement range (`config::DeviceSpec`/`PciDeviceSpec`'s optional
@@ -76,8 +90,8 @@ pub trait Device: Send {
     /// this device wants to raise outside of `write()` (a Python plugin's
     /// `hyperbug.raise_irq()`, in-process or sandboxed). Clears whatever
     /// pending state it reports either way. Most devices never raise one
-    /// this way, hence the default; `PyDevice`/`SandboxedPyDevice` are the
-    /// only overrides today.
+    /// this way, hence the default; `plugin::ScriptedDevice` (both
+    /// transports) is the only override today.
     fn take_pending_irq(&self) -> bool {
         false
     }
@@ -87,10 +101,22 @@ pub trait Device: Send {
     /// e.g. a simulated timer, or an async transaction (a doorbell-style
     /// device bridging to something that completes on its own schedule)
     /// whose completion isn't driven by the guest touching a register at
-    /// all. Most devices have nothing to do here, hence
-    /// the default; a `PyDevice`/`SandboxedPyDevice` whose plugin class
-    /// defines `tick()` are the only overrides today.
+    /// all. Most devices have nothing to do here, hence the default; a
+    /// `plugin::ScriptedDevice` whose plugin class defines `tick()` is the
+    /// only override today.
     fn tick(&mut self) {}
+
+    /// Asks the device to reinitialize its internal state, analogous to a
+    /// real hardware reset line — but, unlike `tick`, never called
+    /// automatically by anything in this codebase: hyperbug models no
+    /// in-guest reset trigger today (no PCI function-level reset, no
+    /// guest-driver-initiated reset), so the only real caller is the live
+    /// control socket's `reset_device` command (`control.rs`), an
+    /// operator explicitly asking a specific device to reset. Most
+    /// devices have nothing to do here, hence the default; a
+    /// `plugin::ScriptedDevice` whose plugin class defines `reset()` is
+    /// the only override today.
+    fn reset(&mut self) {}
 }
 
 /// A shared, lockable handle to a device — the only form a `Bus` (or
@@ -161,9 +187,8 @@ impl Bus {
             // A misbehaving guest (or plugin) shouldn't take the whole VMM
             // down over this: refuse the new mapping and leave whatever
             // was already there working, rather than panicking.
-            eprintln!(
-                "[hyperbug] refusing to map [{base:#x}, {last:#x}]: overlaps existing mapping \
-                 [{:#x}, {:#x}]",
+            crate::log_error!(
+                "refusing to map [{base:#x}, {last:#x}]: overlaps existing mapping [{:#x}, {:#x}]",
                 clash.base, clash.last
             );
             return;

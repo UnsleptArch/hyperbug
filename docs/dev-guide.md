@@ -13,7 +13,9 @@ code does, see [architecture.md](architecture.md). For the plugin ABI, see
 | `iasl` (from `acpica`) | Editing `acpi/dsdt.asl` — `build.rs` recompiles it and fails the build if the embedded `src/dsdt.aml` is out of sync. Silently skipped (with a warning) if not installed — not needed for an ordinary `cargo build`. | `pacman -S acpica` or your distro's equivalent |
 | `busybox` | Building a minimal test initramfs for manual boot testing (not shipped in the repo — you build one yourself when you need to boot something by hand) | `pacman -S busybox` |
 | Python 3.10+ | Writing/running device plugins, and the `hyperbug` package itself | usually already present |
-| `CAP_NET_ADMIN` or root | Only if you pass `--net` — hyperbug creates its own TAP interface at runtime | run under `sudo`, or `setcap cap_net_admin+ep` on the binary |
+| `CAP_NET_ADMIN` or root | Only if you pass `--net` — hyperbug creates its own TAP interface at runtime | run under `sudo`, `setcap cap_net_admin+ep` on the binary, **or** `unshare --user --map-root-user --net` — an *unprivileged* user namespace maps you to root inside a throwaway, isolated network namespace, which is real, sufficient `CAP_NET_ADMIN` with no actual root at all. Confirmed directly against this project's own dev host, not assumed. See "Playing with it interactively" below for the trade-off (an isolated netns is invisible to your already-open browser; plain `sudo` isn't). |
+| `wasm32-unknown-unknown` Rust target | Building `devices/wasm_*.rs` reference plugins, and `wasm_plugin.rs`'s own tests (they compile these on the fly and skip cleanly if the target isn't installed) | `rustup target add wasm32-unknown-unknown` |
+| A C compiler (`cc`/`gcc`) | Building `devices/native_*.c` reference plugins, and `native_plugin.rs`'s own tests (same skip-cleanly convention) | usually already present |
 
 ## Building
 
@@ -140,6 +142,78 @@ vm.wait(timeout=10)
   MWAIT) was inert on the host it was tested on, because KVM already
   reported it unsupported there for unrelated reasons.
 
+## Playing with it interactively
+
+`demo/build.sh` builds `demo/initramfs.cpio.gz` — a minimal busybox image
+with real networking (virtio-net + `httpd` serving a one-line page) and a
+shell — for exactly this: booting a real guest by hand instead of through
+`tests/boot.rs`. `demo/` is gitignored, same as any other throwaway boot
+image; re-run the script any time (e.g. after a kernel upgrade changes
+where its modules live).
+
+None of what follows is a hyperbug bug — every one of these is a real
+shell/job-control/sandboxing interaction that will bite anyone running it
+by hand for the first time, found (and worked through, painfully) in a
+real session:
+
+- **Backgrounding hyperbug (`hyperbug ... &`) without redirecting its
+  stdin away from your terminal stops it outright.** Hyperbug always
+  tries to configure its controlling terminal for the guest console; a
+  backgrounded process that touches the terminal gets `SIGTTIN`/
+  `SIGTTOU`'d by the shell's own job control, and the default disposition
+  is to *stop* the process — `jobs` will show `Stopped`, silently, with
+  no error from hyperbug at all. Fix: redirect stdin, e.g. `hyperbug ...
+  < /dev/null &`.
+  - **The trade-off, stated directly**: doing that makes the guest
+    console *output-only* — real keyboard input to the guest is
+    disabled (hyperbug logs this: `reactor: stdin isn't pollable`). If
+    you actually want to type into the guest interactively, run it in
+    the **foreground** instead (no `&`, no stdin redirect) — that's the
+    only mode with a real interactive console.
+  - **A real trap this causes**: with stdin redirected but stdout *not*
+    redirected, the guest's own shell prompt still prints to your
+    terminal, indistinguishable from a live prompt — but anything you
+    type goes to *your* shell, not the guest (input is disabled, per
+    above). Typing `poweroff -f` in that state runs *your host's own*
+    `poweroff` command, not the guest's.
+- **`sudo` needs a real terminal to prompt for your password.**
+  Backgrounding `sudo hyperbug ... &` with stdin redirected starves that
+  prompt the exact same way — `sudo` ends up permanently `Stopped`
+  waiting for input it can never receive, and nothing after it (e.g. `ip
+  addr add ... dev hyperbug0`) will work, since hyperbug itself never
+  actually started. Fix: run `sudo -v` once, in the foreground, *before*
+  backgrounding anything — it caches your credentials for a few minutes
+  so the later backgrounded `sudo` never needs to touch the terminal:
+  ```sh
+  sudo -v
+  sudo ./target/release/hyperbug --kernel $K --initrd demo/initramfs.cpio.gz \
+      --net --mem 256 < /dev/null > /tmp/hb-net.log 2>&1 &
+  sleep 3
+  sudo ip addr add 10.250.0.1/24 dev hyperbug0
+  ```
+  With real `sudo` (rather than an isolated `unshare` netns), the TAP
+  interface lands in your normal network namespace — reachable from a
+  browser or any other tool you already have open, no extra steps.
+- **An `unshare --user --map-root-user --net`-launched Chromium/Chrome
+  needs `--no-sandbox`.** Chromium refuses to run its sandboxed renderer
+  as root, and `--map-root-user` makes the process look exactly like
+  root from inside that namespace. Firefox doesn't have this restriction.
+  This only matters if you want a GUI browser to reach a `--net` guest
+  *without* real `sudo` — the browser has to be launched **inside** the
+  same `unshare` invocation, since an isolated network namespace's TAP
+  interface is invisible to a browser already running in your normal
+  session:
+  ```sh
+  unshare --user --map-root-user --net bash -c '
+    ip link set lo up
+    ./target/release/hyperbug --kernel $K --initrd demo/initramfs.cpio.gz \
+        --net --mem 256 < /dev/null > /tmp/hb-net.log 2>&1 &
+    for i in $(seq 1 100); do grep -q "network: eth0 up" /tmp/hb-net.log && break; sleep 0.1; done
+    ip addr add 10.250.0.1/24 dev hyperbug0
+    chromium --no-sandbox http://10.250.0.2:8080/
+  '
+  ```
+
 ## Writing a device plugin
 
 See [plugin-api.md](plugin-api.md) for the full contract; the short
@@ -187,8 +261,12 @@ src/
   irq.rs                 irqfd-backed interrupt lines
   device.rs / pci.rs /   the devices themselves
   virtio*.rs / serial.rs
-  pydevice.rs /          the in-process and sandboxed Python plugin
-  pydevice_proc.rs       bridges
+  plugin.rs              ScriptedDevice: the one Device/PciDevice impl
+                         shared by all four plugin transports
+  pydevice.rs /          the in-process (PyO3) and sandboxed (subprocess)
+  pydevice_proc.rs       PluginTransport implementations
+  native_plugin.rs       the C-ABI (dlopen) PluginTransport implementation
+  wasm_plugin.rs          the WASM (wasmtime) PluginTransport implementation
   mem.rs                 guest RAM (huge-page-hinted, checked/unchecked
                          split for DMA)
   error.rs               how a run ends (Result-based, not process::exit)
@@ -196,8 +274,13 @@ src/
   snapshot.rs             the snapshot/restore file format
   seccomp.rs              seccomp-bpf deny-list for the sandboxed-plugin
                          subprocess
+  cgroup.rs               best-effort cgroups v2 memory/CPU limits for
+                         the sandboxed-plugin subprocess
   tty.rs / cpuid.rs      terminal raw-mode handling; CPUID curation
-devices/                 example/reference Python device plugins
+devices/                 example/reference Python, native (C), and WASM
+                         (Rust) device plugins — .so/.wasm files aren't
+                         checked in, compile the .c/.rs sources yourself
+include/                 hyperbug_plugin.h, the native plugin C ABI header
 python/hyperbug/          the installable Python package
 acpi/dsdt.asl             the one hand-authored AML source, compiled via
                          iasl into src/dsdt.aml at build time

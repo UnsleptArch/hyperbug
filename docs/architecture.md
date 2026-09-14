@@ -124,12 +124,17 @@ lock-acquisition overhead for no isolation benefit.
   order of ~245 GiB of addressable guest RAM headroom on a typical layout).
   `MADV_HUGEPAGE`-hinted (opportunistic; failure is advisory-only, no host
   hugetlbfs reservation required).
-- **Serial (COM1)**: a from-scratch 16550 UART (`serial.rs`) implementing
-  enough of THR/LSR/IER/MSR/SCR/RBR for both the kernel's own polled
-  printk console and a real userspace `write()`/interactive shell to work,
-  including the IER-readback autoconfig probe every real 8250 driver
-  performs before trusting the port. `HYPERBUG_SERIAL_TRACE=1` enables a
-  zero-cost-when-unset register-level trace for debugging.
+- **Serial (COM1 + multi-UART)**: a from-scratch 16550 UART (`serial.rs`)
+  implementing enough of THR/LSR/IER/MSR/SCR/RBR for both the kernel's own
+  polled printk console and a real userspace `write()`/interactive shell
+  to work, including the IER-readback autoconfig probe every real 8250
+  driver performs before trusting the port. `HYPERBUG_SERIAL_TRACE=1`
+  enables a zero-cost-when-unset register-level trace for debugging.
+  Parameterized by its own I/O base and an output `Sink` (stdout for
+  COM1, a host file for the three optional, output-only extras —
+  `--uart2-log`/`--uart3-log`/`--uart4-log`, real ISA-convention COM2/
+  COM3/COM4 sharing IRQs the same way real hardware does), so the
+  identical, already-verified register logic backs every port.
 - **ACPI**: RSDP/RSDT/XSDT/FADT/MADT plus one small hand-authored DSDT
   (`acpi/dsdt.asl`, compiled via `iasl`) describing the PCI root bridge's
   `_CRS` (I/O/memory apertures for BAR assignment), `\_SB.PCI0`'s `_PRT`
@@ -140,6 +145,17 @@ lock-acquisition overhead for no isolation benefit.
   every legacy PM1x/GPE register block is honestly zeroed rather than
   half-implemented, and shutdown/reset go through dedicated I/O-port
   devices (`acpi::SleepControl`/`ResetControl`) instead.
+- **SMBIOS/DMI** (`smbios.rs`): a real `_SM_`/`_DMI_` 32-bit entry point
+  plus BIOS/System/Chassis/End-of-Table structures, always present (no
+  flag) the same way ACPI is — hyperbug's Linux-boot-protocol path has no
+  BIOS/UEFI to provide this data otherwise, and real BMC/management
+  firmware routinely reads it for asset/inventory info. Lives in the last
+  4 KiB before `0x100000` (`acpi.rs`'s own `ACPI_LIMIT` is shrunk by
+  exactly that much so its own `--smp`-scaled MADT growth can never
+  collide with it), inside the same real-hardware-convention window every
+  x86 OS scans unconditionally. Verified against a real, unmodified
+  kernel's own `/sys/class/dmi/id/*`, not just against `smbios.rs`'s own
+  byte layout.
 - **PCI**: generic CF8/CFC config-space mechanism (`pci.rs`), bus 0 only,
   type-0 headers, memory and I/O BAR sizing/assignment, a capability list
   with single-message 32-bit MSI (opt-in, for a custom device with a real
@@ -162,6 +178,17 @@ lock-acquisition overhead for no isolation benefit.
   the modern virtio 1.0 PCI transport (`--rng-modern` — the first vertical
   slice of that transport, not yet extended to blk/net), filled from real
   `getrandom(2)` output.
+- **I2C** (`--i2c-device`, `virtio_i2c.rs`): a real `virtio-i2c` adapter
+  (modern transport) with a Python-pluggable target-device bus.
+- **GPIO** (`--gpio-device`, `virtio_gpio.rs`): up to 4 independent real
+  `virtio-gpio` adapters (modern transport), each its own Python-scripted
+  bank, with real guest-delivered interrupts via the `eventq`.
+- **vsock** (`--vsock-uds`, `virtio_vsock.rs`): a real `virtio-vsock`
+  adapter (modern transport) bridging every guest-initiated `AF_VSOCK`
+  stream to one host Unix domain socket, with real credit-based flow
+  control and a dedicated background thread (its own `poll(2)` loop, a
+  command/event channel, and a real eventfd the reactor watches) bridging
+  each stream's bytes — guest-initiated connections only.
 - **Fixed PCI slot/GSI layout** (`machine.rs`, kept static so
   `acpi/dsdt.asl`'s `_PRT` never has to change at runtime):
 
@@ -171,27 +198,76 @@ lock-acquisition overhead for no isolation benefit.
   | 4-11 | up to 8 virtio-blk disks (`--disk`, one slot each) | 10 (shared) |
   | 16 | virtio-net (`--net`) | 11 |
   | 17 | virtio-rng | 12 |
-  | 1-3, 18-31 | free for `--pci-device`/`--pci-device-sandboxed` | — |
+  | 18 | virtio-i2c (`--i2c-device`) | 13 |
+  | 19-22 | up to 4 virtio-gpio banks (`--gpio-device`) | 14 (shared) |
+  | 23 | virtio-vsock (`--vsock-uds`) | 15 |
+  | 1-3, 24-31 | free for `--pci-device`/`--pci-device-sandboxed` | — |
 
-  A `--pci-device` slot outside 4-11/16/17 has no matching `_PRT` entry —
-  it works with ACPI disabled (which trusts the plugin's declared
-  `interrupt_line` directly) but won't route an interrupt under ACPI
-  without adding one.
+  A `--pci-device` slot outside those reserved ranges has no matching
+  `_PRT` entry — it works with ACPI disabled (which trusts the plugin's
+  declared `interrupt_line` directly) but won't route an interrupt under
+  ACPI without adding one.
 
-## Python device plugins
+## Device plugins
 
-See [plugin-api.md](plugin-api.md) for the full contract. In short:
-hyperbug's Rust core knows nothing about any specific device's identity —
-it exposes a generic MMIO/PCI-BAR-mapped register ABI (`read`/`write`,
-optional `tick()`, optional PCI identity attributes) that a plugin
-implements in Python, either loaded in-process via PyO3 (`pydevice.rs`) or
-in its own subprocess (`pydevice_proc.rs`, `--*-sandboxed`) for isolation
-from a plugin that hangs or crashes. A sandboxed plugin's subprocess is
-additionally launched under a real seccomp-bpf deny-list (`seccomp.rs`,
-installed via `Command::pre_exec` between `fork` and `exec`) blocking a
-targeted set of privilege-escalation syscalls — see
-[security.md](security/security.md) for exactly what it does and
-doesn't cover.
+See [plugin-api.md](plugin-api.md) (Python),
+[native-plugin-api.md](native-plugin-api.md) (C ABI), and
+[wasm-plugin-api.md](wasm-plugin-api.md) (WASM) for the full contracts.
+In short: hyperbug's Rust core knows nothing about any specific device's
+identity — it exposes a generic MMIO/PCI-BAR-mapped register ABI
+(`read`/`write`, optional `tick()`/`reset()`, optional PCI identity
+attributes) that a plugin implements in one of four ways, all building
+the exact same concrete `plugin::ScriptedDevice` type — one
+`Device`/`PciDevice` implementation, not four independently hand-rolled
+ones — differing only in which `PluginTransport` they're built with, so
+`vcpu::poll_host` and every other caller drive any of the four through
+the exact same code path:
+
+- **In-process Python** (`pydevice.rs`, `InProcessTransport`) — direct
+  PyO3 calls into an embedded CPython interpreter.
+- **Sandboxed Python** (`pydevice_proc.rs`, `SandboxedTransport`,
+  `--*-sandboxed`) — a binary-framed IPC round trip to a `python3`
+  subprocess, isolating a hang/crash from taking down the guest or VMM.
+  The subprocess additionally runs under a real seccomp-bpf deny-list
+  (`seccomp.rs`, installed via `Command::pre_exec` between `fork` and
+  `exec`) blocking a targeted set of privilege-escalation syscalls, and
+  can optionally be given a cgroups v2 memory ceiling and/or CPU quota
+  (`cgroup.rs`, `mem=`/`cpu=` — best-effort, silently unenforced if
+  cgroups v2 isn't available).
+- **Native C ABI** (`native_plugin.rs`, `NativeTransport`,
+  `--native-device`/`--native-pci-device`) — a direct, in-process call
+  into a `dlopen()`ed shared object (see `include/hyperbug_plugin.h`) —
+  for when a plugin's own overhead (an interpreter, an IPC round trip)
+  genuinely matters, or a plugin needs a language other than Python.
+  **No isolation at all**: full process privileges, no seccomp, no
+  cgroup, no interpreter boundary — see
+  [security.md](security/security.md) for the full trust-tier
+  breakdown across all four.
+- **WASM** (`wasm_plugin.rs`, `WasmTransport`,
+  `--wasm-device`/`--wasm-pci-device`) — a module executed in-process
+  under `wasmtime` (Cranelift JIT). Additive alongside the subprocess
+  model, not a replacement for it: real memory-safety isolation (a
+  module can only touch its own linear memory directly; guest-physical
+  memory access goes through a checked host callback, the same shape as
+  the sandboxed-subprocess transport's DMA calls) at in-process speed —
+  no interpreter, no IPC round trip. Unlike the native transport,
+  `wasmtime`'s own type checking means a module's exports are verified
+  against the exact expected signature at load time — no C-ABI-style
+  "wrong signature is undefined behavior" risk. See
+  [wasm-plugin-api.md](wasm-plugin-api.md).
+
+A plugin can also define an optional `reset()` hook (mirroring `tick()`'s
+opt-in mechanism exactly) and be **hot-reloaded** — re-read from disk and
+swapped into its existing bus/BAR slot in place — via the live control
+socket's `reset_device`/`reload_device` commands (`control.rs`,
+`machine::reload_plugin`), with no guest reboot and no address change.
+`machine.rs` keeps a `PluginRegistryEntry` per loaded plugin (its
+original path/class/DMA-range/resource-limits, plus the concrete
+`Arc<Mutex<plugin::ScriptedDevice>>` the buses also hold) specifically to
+make this possible; a PCI plugin's reload is refused outright if the
+freshly-loaded file's PCI identity doesn't exactly match what's already
+registered, since `PciBus` caches that identity once at registration and
+has no way to notice a change later.
 
 ## Snapshot/restore
 

@@ -4,7 +4,10 @@
 //! Exists because a real systemd/journald boot can stall for a long time
 //! waiting on `/dev/random` entropy with no hardware RNG present.
 
+use std::sync::{Arc, Mutex};
+
 use crate::mem::GuestMemory;
+use crate::record::{EventKind, Recorder, Replayer};
 use crate::virtio::{ChainOutcome, DescChain, VirtioDeviceOps};
 
 /// Entropy is generated in chunks through one reusable buffer rather than
@@ -16,17 +19,57 @@ const CHUNK: usize = 4096;
 #[derive(Default)]
 pub struct VirtioRng {
     buf: Vec<u8>,
+    /// `Some` only when `--record` was given. Unlike keyboard/TAP input
+    /// (`reactor.rs`), an RNG request is synchronous from the guest's own
+    /// point of view — there's no delivery *timing* to capture, only the
+    /// data — but recording it matters just as much for a future replay:
+    /// a real Linux guest derives real internal state (stack-protector
+    /// canaries, ASLR slide values) from its first RNG reads, so handing
+    /// a replayed guest *different* random bytes than the recording did
+    /// would make it diverge almost immediately, independent of how
+    /// exactly interrupt timing is replayed.
+    recorder: Option<Arc<Recorder>>,
+    /// `Some` only when `--replay` was given (mutually exclusive with
+    /// `recorder` — hyperbug never records and replays the same run).
+    /// Consulted instead of `getrandom(2)` — see `Replayer::next_rng_bytes`.
+    replayer: Option<Arc<Mutex<Replayer>>>,
 }
 
 impl VirtioRng {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(recorder: Option<Arc<Recorder>>, replayer: Option<Arc<Mutex<Replayer>>>) -> Self {
+        Self { recorder, replayer, ..Self::default() }
+    }
+
+    /// Produces up to `want` bytes: from the recording under `--replay`
+    /// (falling back to real `getrandom` only once that's exhausted — see
+    /// `Replayer::next_rng_bytes`'s own doc comment for why), or real
+    /// `getrandom(2)` otherwise. `None` means no entropy is available
+    /// right now (matches `getrandom`'s own "would block" case).
+    fn fill_random(&mut self, want: usize) -> Option<Vec<u8>> {
+        if let Some(replayer) = &self.replayer
+            && let Some(bytes) = replayer.lock().unwrap().next_rng_bytes(want)
+        {
+            return Some(bytes);
+        }
+        // SAFETY: `self.buf` was already resized to at least `CHUNK` >=
+        // `want` bytes by `process_chain` before calling this; getrandom
+        // with flags=0 blocks only before the kernel CSPRNG is first
+        // seeded, same as reading /dev/urandom.
+        let got = unsafe { libc::getrandom(self.buf.as_mut_ptr().cast(), want, 0) };
+        if got <= 0 {
+            return None;
+        }
+        Some(self.buf[..got as usize].to_vec())
     }
 }
 
 impl VirtioDeviceOps for VirtioRng {
     fn legacy_pci_device_id(&self) -> u16 {
         0x1005 // "Virtio RNG", per /usr/share/hwdata/pci.ids
+    }
+
+    fn virtio_device_type(&self) -> u16 {
+        4 // VIRTIO_ID_RNG, per <linux/virtio_ids.h>
     }
 
     fn pci_class_code(&self) -> u32 {
@@ -56,21 +99,18 @@ impl VirtioDeviceOps for VirtioRng {
             let mut addr = b.addr;
             while remaining > 0 {
                 let want = remaining.min(CHUNK);
-                // SAFETY: `self.buf` is a valid, initialized buffer of at
-                // least `want` bytes; getrandom with flags=0 blocks only
-                // before the kernel CSPRNG is first seeded, same as
-                // reading /dev/urandom.
-                let got = unsafe { libc::getrandom(self.buf.as_mut_ptr().cast(), want, 0) };
-                if got <= 0 {
+                let Some(bytes) = self.fill_random(want) else {
                     return ChainOutcome::Done(written); // no entropy available; report what we did fill
-                }
-                let got = got as usize;
-                if !mem.write_checked(addr, &self.buf[..got]) {
+                };
+                if !mem.write_checked(addr, &bytes) {
                     return ChainOutcome::Done(written);
                 }
-                written += got as u32;
-                addr += got as u64;
-                remaining -= got;
+                if let Some(recorder) = &self.recorder {
+                    recorder.record(EventKind::RngBytes, &bytes);
+                }
+                written += bytes.len() as u32;
+                addr += bytes.len() as u64;
+                remaining -= bytes.len();
             }
         }
         ChainOutcome::Done(written)
@@ -107,7 +147,7 @@ mod tests {
         ) {
             let mut mem = GuestMemory::new(MEM_SIZE as usize).unwrap();
             let chain = DescChain::for_test(buffers);
-            let mut rng = VirtioRng::new();
+            let mut rng = VirtioRng::new(None, None);
 
             let ChainOutcome::Done(written) = rng.process_chain(0, &mut mem, &chain) else {
                 prop_assert!(false, "virtio-rng never defers completion");
@@ -138,12 +178,51 @@ mod tests {
         ) {
             let mut mem = GuestMemory::new(MEM_SIZE as usize).unwrap();
             let chain = DescChain::for_test(vec![DescBuffer { addr, len, device_writable: true }]);
-            let mut rng = VirtioRng::new();
+            let mut rng = VirtioRng::new(None, None);
             let ChainOutcome::Done(written) = rng.process_chain(0, &mut mem, &chain) else {
                 prop_assert!(false, "virtio-rng never defers completion");
                 unreachable!();
             };
             prop_assert_eq!(written, len);
         }
+    }
+
+    /// A real `Recorder` (Milestone 2, `record.rs`), attached to this
+    /// test's own thread rather than a live guest's vCPU (no KVM needed
+    /// for this one — `process_chain` is called directly): confirms
+    /// `VirtioRng` actually records the *real* random bytes it wrote to
+    /// guest memory, not a placeholder, by comparing the recorded event's
+    /// data against what a direct read-back of guest memory shows.
+    #[test]
+    fn a_recorder_captures_the_real_bytes_written_to_guest_memory() {
+        let path = std::env::temp_dir().join(format!("hyperbug-rng-record-test-{}.bin", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+        let recorder = match crate::record::Recorder::start(&path_str, std::process::id() as libc::pid_t, MEM_SIZE) {
+            Ok(r) => std::sync::Arc::new(r),
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+
+        let mut mem = GuestMemory::new(MEM_SIZE as usize).unwrap();
+        let addr = 0x100u64;
+        let len = 32u32;
+        let chain = DescChain::for_test(vec![DescBuffer { addr, len, device_writable: true }]);
+        let mut rng = VirtioRng::new(Some(recorder), None);
+        let ChainOutcome::Done(written) = rng.process_chain(0, &mut mem, &chain) else {
+            panic!("virtio-rng never defers completion");
+        };
+        assert_eq!(written, len);
+
+        let mut actual = vec![0u8; len as usize];
+        mem.read_checked(addr, &mut actual);
+
+        let (_, events) = crate::record::read_all(&path_str).unwrap();
+        assert_eq!(events.len(), 1, "exactly one RngBytes event should have been recorded");
+        assert_eq!(events[0].kind, crate::record::EventKind::RngBytes);
+        assert_eq!(events[0].data, actual, "the recorded bytes must match what was actually written to guest memory");
+
+        std::fs::remove_file(&path_str).unwrap();
     }
 }

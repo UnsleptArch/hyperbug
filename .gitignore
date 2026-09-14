@@ -4,5 +4,10 @@
 .claude
 CLAUDE.md
 /DEBTS.md
+/list.md
 __pycache__/
-/demo
+/demo/*
+!/demo/build.sh
+devices/*.so
+devices/*.wasm
+/hyperbug-crash-*.json

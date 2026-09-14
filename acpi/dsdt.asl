@@ -56,6 +56,13 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "HYPRBG", "HBDSDT", 1)
 
     Scope (\_SB)
     {
+        // COM1/COM3 share IRQ 4, and COM2/COM4 share IRQ 3 — real,
+        // period-correct ISA convention (Linux's 8250 driver requests
+        // each with IRQF_SHARED for exactly this reason), not a
+        // hyperbug-specific shortcut. Declared `Shared` on both ends of
+        // each pair, matching how a real BIOS's DSDT describes this same
+        // pairing. Machine.rs's `serial::COM1_IRQ`/`COM2_IRQ`/`COM3_IRQ`/
+        // `COM4_IRQ` are the single source of truth these must track.
         Device (COM1)
         {
             Name (_HID, EisaId ("PNP0501")) // 16550A-compatible serial port
@@ -63,7 +70,48 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "HYPRBG", "HBDSDT", 1)
             Name (_CRS, ResourceTemplate ()
             {
                 IO (Decode16, 0x03F8, 0x03F8, 0x00, 0x08)
-                IRQNoFlags () {4}
+                IRQ (Edge, ActiveHigh, Shared) {4}
+            })
+        }
+
+        // COM2/COM3/COM4 are always described here regardless of whether
+        // `--uart2-log`/`--uart3-log`/`--uart4-log` was actually given —
+        // a real BIOS's DSDT is compiled once too, and machine.rs's own
+        // "None means real hardware's floating-bus convention" handling
+        // (vcpu.rs's `handle_extra_uart_in`) is exactly what makes an
+        // unrequested port safe to always describe: the guest's own
+        // 8250 autoconfig probe simply finds nothing real there and
+        // skips it, the same as a genuinely empty Super I/O UART slot.
+        Device (COM2)
+        {
+            Name (_HID, EisaId ("PNP0501"))
+            Name (_UID, 0x02)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x02F8, 0x02F8, 0x00, 0x08)
+                IRQ (Edge, ActiveHigh, Shared) {3}
+            })
+        }
+
+        Device (COM3)
+        {
+            Name (_HID, EisaId ("PNP0501"))
+            Name (_UID, 0x03)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x03E8, 0x03E8, 0x00, 0x08)
+                IRQ (Edge, ActiveHigh, Shared) {4}
+            })
+        }
+
+        Device (COM4)
+        {
+            Name (_HID, EisaId ("PNP0501"))
+            Name (_UID, 0x04)
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x02E8, 0x02E8, 0x00, 0x08)
+                IRQ (Edge, ActiveHigh, Shared) {3}
             })
         }
 
@@ -99,7 +147,7 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "HYPRBG", "HBDSDT", 1)
             // hyperbug PCI device uses INTA# (Pin 0) and Source=Zero
             // (GSI given directly via SourceIndex, no Link Device
             // indirection) — matching the fixed IRQs main.rs assigns.
-            Name (_PRT, Package (0x0A)
+            Name (_PRT, Package (0x10)
             {
                 // virtio-blk: slots 4-11 (main.rs::VIRTIO_BLK_SLOT_BASE/
                 // MAX_DISKS), all sharing IRQ 10 (main.rs::VIRTIO_BLK_IRQ).
@@ -114,7 +162,20 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "HYPRBG", "HBDSDT", 1)
                 // virtio-net: slot 16 (main.rs::VIRTIO_NET_SLOT), IRQ 11.
                 Package (0x04) { 0x0010FFFF, 0x00, Zero, 0x0B },
                 // virtio-rng: slot 17 (main.rs::VIRTIO_RNG_SLOT), IRQ 12.
-                Package (0x04) { 0x0011FFFF, 0x00, Zero, 0x0C }
+                Package (0x04) { 0x0011FFFF, 0x00, Zero, 0x0C },
+                // virtio-i2c: slot 18 (machine.rs::slots::I2C), IRQ 13
+                // (machine.rs::gsi::I2C).
+                Package (0x04) { 0x0012FFFF, 0x00, Zero, 0x0D },
+                // virtio-gpio: slots 19-22 (machine.rs::slots::GPIO_BASE/
+                // GPIO_MAX_BANKS), all sharing IRQ 14 (machine.rs::gsi::
+                // GPIO) — real PCI IRQ sharing, same as virtio-blk above.
+                Package (0x04) { 0x0013FFFF, 0x00, Zero, 0x0E },
+                Package (0x04) { 0x0014FFFF, 0x00, Zero, 0x0E },
+                Package (0x04) { 0x0015FFFF, 0x00, Zero, 0x0E },
+                Package (0x04) { 0x0016FFFF, 0x00, Zero, 0x0E },
+                // virtio-vsock: slot 23 (machine.rs::slots::VSOCK), IRQ 15
+                // (machine.rs::gsi::VSOCK).
+                Package (0x04) { 0x0017FFFF, 0x00, Zero, 0x0F }
             })
         }
     }

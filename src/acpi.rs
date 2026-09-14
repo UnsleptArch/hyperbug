@@ -38,7 +38,16 @@ const IOAPIC_ADDR: u32 = 0xfec0_0000;
 /// isn't covered by either e820 entry `loader.rs` emits, matching real
 /// hardware's BIOS ROM/reserved area rather than being an oversight.
 const ACPI_BASE: u64 = 0xe0000;
-const ACPI_LIMIT: u64 = 0x10_0000; // 1 MiB: where the kernel image starts
+/// 1 MiB (where the kernel image starts) minus a reserved 4 KiB at the
+/// very top for `smbios.rs`'s own entry point + tables (`smbios::
+/// SMBIOS_BASE`) — both live in the same real-hardware-convention
+/// "unconditionally scanned" window (ACPI's RSDP scan covers
+/// `[0xE0000, 0xFFFFF]`; SMBIOS's own scan is the narrower `[0xF0000,
+/// 0xFFFFF]`), so this shrink is what keeps ACPI's own growth (the MADT
+/// scales with `--smp`) from ever colliding with the fixed SMBIOS region
+/// — enforced by the existing `end > ACPI_LIMIT` check below, not a new
+/// mechanism.
+const ACPI_LIMIT: u64 = 0x10_0000 - 0x1000;
 /// The RSDP is the one table at a *fixed* address (it's found by scanning
 /// for its signature, so it has to be where the scan starts and 16-byte
 /// aligned). Everything else is packed after it by `TableWriter`.
@@ -66,7 +75,7 @@ const RESET_VALUE: u8 = 0x01;
 
 static DSDT_AML: &[u8] = include_bytes!("dsdt.aml");
 
-fn checksum(bytes: &[u8]) -> u8 {
+pub(crate) fn checksum(bytes: &[u8]) -> u8 {
     0u8.wrapping_sub(bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)))
 }
 
@@ -337,6 +346,10 @@ pub mod exit_code {
     // genuine dead end — see main.rs's VcpuExit::Hlt handling) — kept
     // reserved, not reused, since python/hyperbug/vm.py's ExitCode.HALTED
     // still documents it for any process that was built before this change.
+    /// The guest was live-migrated away via the control socket's
+    /// `migrate <host:port>` command (`migrate.rs`) — not a failure, the
+    /// guest is simply running in a different process now.
+    pub const MIGRATED_AWAY: i32 = 13;
 }
 
 /// The `SLEEP_CONTROL_REG`/`SLEEP_STATUS_REG` pair (ACPI 5.0's
@@ -369,7 +382,7 @@ impl Device for SleepControl {
 
     fn write(&mut self, _offset: u64, data: &[u8]) -> bool {
         if data.first().is_some_and(|&b| b & SLP_EN != 0) {
-            eprintln!("[hyperbug] guest requested ACPI shutdown (S5)");
+            crate::log_info!("guest requested ACPI shutdown (S5)");
             request_exit(&self.exit, Ok(GuestExit::CleanShutdown));
         }
         false
@@ -398,7 +411,7 @@ impl Device for ResetControl {
 
     fn write(&mut self, _offset: u64, data: &[u8]) -> bool {
         if data.first() == Some(&RESET_VALUE) {
-            eprintln!("[hyperbug] guest requested ACPI reset (reboot)");
+            crate::log_info!("guest requested ACPI reset (reboot)");
             request_exit(&self.exit, Ok(GuestExit::RequestedReboot));
         }
         false
