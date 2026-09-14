@@ -5,29 +5,25 @@
 <h1 align="center">hyperbug</h1>
 
 <p align="center">
-  <b>A KVM-backed VMM whose devices you write in Python, not Rust.</b><br>
-  Real hardware-assisted virtualization. Real unmodified guest kernels. Real drivers.<br>
-  Standing up a new virtual device is a matter of writing a Python file — not recompiling a hypervisor.
+  A VMM built on KVM where devices are Python scripts instead of Rust code.
 </p>
 
 ---
 
-## Why hyperbug exists
+hyperbug is a small virtual machine monitor built directly on Linux KVM. The core is Rust and stays small on purpose. It's just enough to boot a guest kernel and get memory, interrupts, and PCI right. Anything that would normally mean recompiling a hypervisor, like adding a new device, is instead a Python file.
 
-Emulators like Unicorn are fantastic for running *code* in isolation — but the moment you need a real guest OS talking to a real driver over a real bus, with real interrupts and real DMA, you're out of their depth. Full hypervisors like QEMU give you that, but their device model lives deep in a huge C codebase you don't want to touch just to prototype one fake NIC.
+Unicorn and friends are great for running code in isolation, but the moment you need an actual guest OS talking to an actual driver over an actual bus, they run out of road. QEMU gets you there, but its device model lives in a C codebase most people don't want to open just to fake one NIC. hyperbug is the middle ground. KVM does the heavy lifting and you write the device.
 
-hyperbug sits in between: a **small, hackable VMM built directly on Linux KVM**, with a Rust core just large enough to boot a guest and route memory/interrupts/PCI correctly — and every actual *device* is a scriptable plugin. Want to reverse-engineer how a driver probes a piece of hardware? Fuzz a management controller's attack surface? Bridge a real guest OS into an existing emulation harness? Write the device in ~20 lines of Python and boot a real kernel against it.
+## What's in it
 
-## What you actually get
-
-- **Real KVM, not an emulator.** Hardware virtualization, long mode, the real Linux boot protocol, real ACPI + SMBIOS tables — no BIOS/firmware layer standing between you and the guest.
-- **Devices as scripts.** A virtual PCI/MMIO device is a Python class with `read`/`write`. Real DMA against guest memory, spontaneous interrupts, PCI capability lists + MSI, hot-reload without rebooting the guest.
-- **A real virtio device zoo.** Block (io_uring-backed), network (a real TAP interface), entropy, I2C, GPIO (with real guest-delivered interrupts), and vsock (a real host↔guest control channel bridged to a Unix socket) — every one verified against the guest's own unmodified upstream Linux driver, not a toy stand-in.
-- **Real SMP.** Additional vCPUs come up through a genuine INIT-SIPI-SIPI sequence, the same way real silicon does — not a faked CPU count.
-- **A choice of sandboxing, not a single trust level.** In-process Python for speed, a sandboxed subprocess when you don't trust the plugin, a native C ABI when Python's overhead is the bottleneck, or WebAssembly for real memory-safety isolation at near-native speed.
-- **Debugging tools that outclass a plain emulator.** A real GDB/LLDB remote stub, live memory/register control over a socket while the guest runs, Chrome-trace VM-exit profiling, automatic crash postmortems, and poll-granularity **record-and-replay** for deterministic re-execution.
-- **Snapshot, fork, and live migration.** Serialize a running guest to disk, clone one instantly via copy-on-write `fork()`, or migrate it live to another host process — the same primitives that make fuzzing a whole VM state-space tractable.
-- **Verified against real boots, not just unit tests.** Every feature above is checked by an automated test that actually boots a real kernel under real KVM and drives it — not mocked, not assumed.
+- **KVM, not emulation.** Long mode, the Linux boot protocol, ACPI and SMBIOS tables. No BIOS layer in the way.
+- **Devices as Python.** A PCI or MMIO device is a class with `read`/`write`. DMA against guest memory, spontaneous interrupts, PCI capability lists and MSI, hot reload without rebooting the guest.
+- **A decent virtio lineup.** Block using io_uring, network over TAP, entropy, I2C, GPIO with guest delivered interrupts, and vsock as a channel between host and guest bridged over a Unix socket. Each one is checked against the guest's own unmodified upstream driver.
+- **SMP that isn't faked.** Extra vCPUs come up through an actual INIT SIPI SIPI sequence.
+- **Pick your isolation level.** In process Python if you trust the plugin, a sandboxed subprocess if you don't, a C ABI if Python overhead is the problem, or WASM if you want memory safety without the subprocess round trip.
+- **Debugging that doesn't suck.** A GDB or LLDB remote stub, live memory and register control over a socket while the guest runs, Chrome trace VM exit profiling, automatic crash dumps, and record and replay for deterministic reruns.
+- **Snapshot, fork, migrate.** Dump a running guest to disk, clone one instantly with a copy on write `fork()`, or move it to another process live.
+- **Tests that actually boot a kernel.** Every feature above has an automated test that boots real KVM and drives it. Nothing here is mocked.
 
 ## Quick start
 
@@ -36,7 +32,7 @@ cargo build --release
 ./target/release/hyperbug --kernel /path/to/bzImage --initrd /path/to/initramfs.cpio.gz
 ```
 
-The serial console is a real two-way interactive terminal — your keystrokes go to the guest, its output comes back. Press **Ctrl-]** to quit at any time.
+The serial console is a two way interactive terminal. Type into it and see the guest's output. Ctrl-] to quit.
 
 ```python
 from hyperbug import VM
@@ -45,7 +41,7 @@ with VM("bzImage", mem_mb=512, disks=["disk.img"], net=True) as vm:
     exit_code = vm.wait()
 ```
 
-## Write a device in five minutes
+## Write a device
 
 ```python
 from hyperbug import Device
@@ -66,51 +62,51 @@ class MyDevice(Device):
     --device path/to/my_device.py:MyDevice:0xd0000000:0x1000
 ```
 
-That's a real MMIO device a real guest driver can probe and talk to. Need DMA, spontaneous interrupts, a PCI identity, sandboxing, or hot-reload? See [docs/plugin-api.md](docs/plugin-api.md). Prefer C, Rust, or Wasm instead of Python? See [docs/native-plugin-api.md](docs/native-plugin-api.md) (no isolation — read the security note first) or [docs/wasm-plugin-api.md](docs/wasm-plugin-api.md) (real sandboxing, in-process speed).
+That's a working MMIO device a guest driver can probe. For DMA, interrupts, a PCI identity, sandboxing, or hot reload, see [docs/plugin-api.md](docs/plugin-api.md). Want C, Rust, or Wasm instead of Python? Check [docs/native-plugin-api.md](docs/native-plugin-api.md) (no isolation, read the security note first) or [docs/wasm-plugin-api.md](docs/wasm-plugin-api.md) (sandboxed, in process speed).
 
 ## Status
 
-Under active development; see [docs/status.md](docs/status.md) for an honest, current breakdown of what's verified against real KVM boots, what works but is narrower in scope than it looks, and what's explicitly not built yet.
+Under active development. [docs/status.md](docs/status.md) has an honest breakdown of what's verified against real boots, what's narrower than it looks, and what isn't built yet.
 
 ## Documentation
 
 | Doc | Covers |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | How hyperbug is put together internally: process/thread model, boot path, device model, design rationale, and hard-won lessons from past bugs. |
-| [docs/plugin-api.md](docs/plugin-api.md) | The full `Device`/`PciDevice`/`I2cDevice`/`GpioBank` Python plugin ABIs, the `hyperbug` Python package (`VM`, live control, snapshot/restore, hot-reload), and reference plugins. |
-| [docs/native-plugin-api.md](docs/native-plugin-api.md) | The C-ABI plugin contract for `--native-device`/`--native-pci-device` — for when Python's overhead genuinely matters. **No isolation at all**; read this before using it. |
-| [docs/wasm-plugin-api.md](docs/wasm-plugin-api.md) | The WASM plugin contract for `--wasm-device`/`--wasm-pci-device` — real memory-safety sandboxing at in-process speed, additive alongside the subprocess and native transports. |
-| [docs/debugging.md](docs/debugging.md) | The GDB/LLDB remote stub, Chrome-trace VM-exit profiling, and crash postmortems. |
-| [docs/record-replay.md](docs/record-replay.md) | Deterministic record-and-replay: what's captured, what isn't, and the real limitations. |
-| [docs/security/security.md](docs/security/security.md) | Trust boundaries, what's enforced against a hostile guest or an untrusted plugin, and what's explicitly out of scope today. |
-| [docs/security/defendmap.md](docs/security/defendmap.md) | The concrete attack-surface map: every place untrusted bytes reach hyperbug's code, and whether that surface is defended, partially defended, or still held open. |
-| [docs/security/unsafe-audit.md](docs/security/unsafe-audit.md) | A consolidated review of every `unsafe` block in the codebase, file by file. |
-| [docs/dev-guide.md](docs/dev-guide.md) | Building, testing (including the real KVM-backed boot tests), debugging techniques, and contribution conventions. |
+| [docs/architecture.md](docs/architecture.md) | Process/thread model, boot path, device model, and why things are built the way they are. |
+| [docs/plugin-api.md](docs/plugin-api.md) | The `Device`/`PciDevice`/`I2cDevice`/`GpioBank` Python ABIs, the `hyperbug` package (`VM`, live control, snapshot/restore, hot reload), reference plugins. |
+| [docs/native-plugin-api.md](docs/native-plugin-api.md) | The C ABI plugin contract. No isolation at all. Read this first. |
+| [docs/wasm-plugin-api.md](docs/wasm-plugin-api.md) | The WASM plugin contract. Sandboxed, in process speed. |
+| [docs/debugging.md](docs/debugging.md) | GDB/LLDB stub, trace export, crash postmortems. |
+| [docs/record-replay.md](docs/record-replay.md) | What record/replay captures, what it doesn't, and the limits. |
+| [docs/security/security.md](docs/security/security.md) | Trust boundaries and what's out of scope today. |
+| [docs/security/defendmap.md](docs/security/defendmap.md) | Every place untrusted bytes reach hyperbug's code, and whether it's defended. |
+| [docs/security/unsafe-audit.md](docs/security/unsafe-audit.md) | Every `unsafe` block, file by file. |
+| [docs/dev-guide.md](docs/dev-guide.md) | Building, testing, debugging, contribution conventions. |
 | [docs/cli-reference.md](docs/cli-reference.md) | Every CLI flag and exit code. |
-| [docs/status.md](docs/status.md) | What's verified, what's narrower than it looks, what's not done. |
+| [docs/status.md](docs/status.md) | What's verified, what's not. |
 
 ## Requirements
 
-See [docs/dev-guide.md](docs/dev-guide.md#requirements) for the full table. In short: a Rust toolchain, `/dev/kvm` for anything that actually runs a guest, and Python 3.10+ for device plugins. `iasl`/`busybox` are only needed for specific workflows (editing the ACPI DSDT, building a test initramfs by hand).
+Full table in [docs/dev-guide.md](docs/dev-guide.md#requirements). Short version, you need a Rust toolchain, `/dev/kvm` to run anything, and Python 3.10+ for plugins. `iasl` and `busybox` only matter if you're editing the ACPI DSDT or building a test initramfs by hand.
 
 ## Project layout
 
 ```
 src/            Rust VMM core
-devices/        example/reference Python, native (C), and WASM (Rust) device plugins
+devices/        example Python, native (C), and WASM (Rust) device plugins
 include/        hyperbug_plugin.h, the native plugin C ABI header
 python/hyperbug/ the installable Python package (device base classes, VM launcher)
-acpi/dsdt.asl   hand-authored AML source, compiled via iasl at build time
-tests/boot.rs   real KVM-backed integration tests
+acpi/dsdt.asl   AML source written by hand, compiled via iasl at build time
+tests/boot.rs   integration tests that run against real KVM
 docs/           architecture, plugin APIs, security, dev guide, CLI reference, status
 ```
 
-See [docs/dev-guide.md](docs/dev-guide.md#project-layout) for the per-file breakdown of `src/`.
+File by file breakdown of `src/` is in [docs/dev-guide.md](docs/dev-guide.md#project-layout).
 
 ## Contributing
 
-This is a research/hobby project; expect rough edges. Read [docs/dev-guide.md](docs/dev-guide.md) before making a change — it covers the testing bar (`cargo test --release` including real boot tests, `cargo clippy -- -D warnings`) and a few design conventions worth preserving.
+This is a research/hobby project, so expect rough edges. Read [docs/dev-guide.md](docs/dev-guide.md) before sending changes. It covers the testing bar (`cargo test --release`, including the real boot tests, and `cargo clippy -- -D warnings`) and a few conventions worth keeping.
 
 ## License
 
-Not yet declared. Do not assume permission to redistribute until a license file is added.
+GPLv3. See [LICENSE](LICENSE).
